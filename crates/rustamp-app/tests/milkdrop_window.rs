@@ -254,12 +254,14 @@ fn run_case(label: &str, empty_presets: bool, expected_note: &str, shot: &str) {
              $g = [System.Drawing.Graphics]::FromImage($b); \
              $g.CopyFromScreen({left},{top},0,0,$b.Size); \
              $b.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); \
-             $n = 0; \
-             for ($y = {body_top}; $y -lt {height}; $y += 2) {{ \
-                 for ($x = 0; $x -lt {width}; $x += 2) {{ \
-                     if ($b.GetPixel($x,$y).GetBrightness() -gt 0.1) {{ $n++ }} \
+             $n = 0; $bar = 0; \
+             for ($y = 0; $y -lt {height}; $y += 1) {{ \
+                 for ($x = 0; $x -lt {width}; $x += 1) {{ \
+                     if ($b.GetPixel($x,$y).GetBrightness() -gt 0.1) {{ \
+                         if ($y -lt {body_top}) {{ $bar++ }} else {{ $n++ }} \
+                     }} \
                  }} \
-             }}; $n",
+             }}; \"$bar $n\"",
             png.display()
         ),
         120,
@@ -267,15 +269,24 @@ fn run_case(label: &str, empty_presets: bool, expected_note: &str, shot: &str) {
     note(
         &mut report,
         &out,
-        format!("{label}: lit pixels (sampled) {bright}"),
+        format!("{label}: lit pixels (title, body) {bright}"),
     );
-    let bright: u32 = bright
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("no pixel count: {bright}"));
+    let counts: Vec<u32> = bright
+        .split_whitespace()
+        .filter_map(|count| count.trim().parse().ok())
+        .collect();
+    let (bar, body) = match counts.as_slice() {
+        [bar, body] => (*bar, *body),
+        _ => panic!("no pixel counts: {bright}"),
+    };
     assert!(
-        bright > 20,
-        "{label}: the body is black, {bright} lit pixels; see {}",
+        bar > 20,
+        "{label}: the window is not painted at all ({bar} lit pixels in the title bar); see {}",
+        png.display()
+    );
+    assert!(
+        body > 20,
+        "{label}: the body is black, {body} lit pixels and {bar} in the title bar; see {}",
         png.display()
     );
 

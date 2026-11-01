@@ -708,6 +708,36 @@ mod win {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // A panic must not unwind through the system's callback boundary: that
+        // aborts the whole host and takes every loaded plug-in with it. A
+        // message that fails leaves the frame as it was.
+        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: the caller's own arguments, passed on unchanged.
+            unsafe { frame_message(window, message, wparam, lparam) }
+        }));
+        match answer {
+            Ok(answer) => answer,
+            Err(_) => {
+                crate::fault::trace_event(
+                    "a message of an embed frame panicked; the frame keeps its last picture",
+                );
+                // SAFETY: the default handling of a message of our own window.
+                unsafe { DefWindowProcW(window, message, wparam, lparam) }
+            }
+        }
+    }
+
+    /// One message of a frame, with the panic boundary taken off.
+    ///
+    /// # Safety
+    ///
+    /// Win32 passes a message of this frame.
+    unsafe fn frame_message(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         // The plug-in decides what closing means: `vis_avs` stops and destroys
         // the frame itself. A frame without a child closes as any window does.
         if message == WM_CLOSE {
