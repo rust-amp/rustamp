@@ -40,9 +40,10 @@ const BLOCK_FRAMES: usize = 576;
 /// How far ahead of real time the thread may run: the plug-in's buffer fills
 /// first, so a stutter of the helper does not reach the output at once.
 const AHEAD: Duration = Duration::from_millis(250);
-/// How long the end of a run waits for a plug-in's own buffer: longer than the
-/// two seconds `out_wave` opens with.
-const PLUGIN_DRAIN: Duration = Duration::from_millis(2_500);
+/// How long the end of a run waits for a plug-in's own buffer: the two seconds
+/// `out_wave` opens with, plus the quarter second this thread is paced ahead of
+/// real time, plus a margin. The engine caps the wait at three seconds anyway.
+const PLUGIN_DRAIN: Duration = Duration::from_millis(3_000);
 /// Bounds the wait for the player to name the track before the first block.
 const TRACK_WAIT: Duration = Duration::from_secs(1);
 /// How far the clock may fall behind the blocks handed over: more than any
