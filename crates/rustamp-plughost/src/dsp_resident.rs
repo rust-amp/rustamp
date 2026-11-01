@@ -589,12 +589,18 @@ mod imp {
                     return;
                 }
                 Message::CommandToHost(Command::PausePlugin { .. }) => {
-                    crate::fault::trace_event("output chain: pause");
+                    crate::fault::trace_event(&format!(
+                        "output chain: pause at played {:?}",
+                        self.played_ms()
+                    ));
                     self.set_paused(true);
                     TransportState::Paused
                 }
                 Message::CommandToHost(Command::UnpausePlugin { .. }) => {
-                    crate::fault::trace_event("output chain: unpause");
+                    crate::fault::trace_event(&format!(
+                        "output chain: unpause at played {:?}",
+                        self.played_ms()
+                    ));
                     self.set_paused(false);
                     TransportState::Playing
                 }
