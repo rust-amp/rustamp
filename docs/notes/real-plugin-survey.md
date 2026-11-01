@@ -217,3 +217,38 @@ plug-in's folder questions from the folder the plug-in sits in. Same limits as
 run 9: GPU-less guest, fixed-function path (`MaxPSVersion=0` in the staged
 `milk2.ini`), no real audio device, and the data files and presets are staged,
 not shipped.
+
+## Run 11 (2026-11-01): all eleven load, and the whole suite plays them
+
+`real_plugin_survey.rs` runs inside the VM acceptance run of the 1.2.0 release
+with the Winamp 5.66 plug-ins and their runtime DLLs staged beside them. Its
+`plugin-survey.txt` for this run:
+
+```
+SURVEY dsp_sps.dll [Dsp]: LOADED as "Nullsoft Signal Processing Studio DSP v0.39b"
+SURVEY gen_hotkeys.dll [General]: LOADED as "nullsoft(gen_hotkeys.dll)"
+SURVEY gen_jumpex.dll [General]: LOADED as "nullsoft(gen_jumpex.dll)"
+SURVEY in_flac.dll [Input]: LOADED as "Nullsoft FLAC Decoder v3.1"
+SURVEY in_vorbis.dll [Input]: LOADED as "Nullsoft Vorbis Decoder v1.75"
+SURVEY in_wave.dll [Input]: LOADED as "Nullsoft Waveform Decoder v3.24"
+SURVEY out_disk.dll [Output]: LOADED as "Nullsoft Disk Writer v2.17"
+SURVEY out_wave.dll [Output]: LOADED as "Nullsoft WaveOut Output v2.16"
+SURVEY vis_avs.dll [Visualization]: LOADED as "Advanced Visualization Studio v2.82"
+SURVEY vis_milk2.dll [Visualization]: LOADED as "MilkDrop v2.25c"
+SURVEY vis_nsfs.dll [Visualization]: LOADED as "Nullsoft Tiny Fullscreen v2.14"
+SURVEY loaded 11 of 17
+```
+
+The six skipped files are the plug-ins' own dependencies (`msvcr90`,
+`libFLAC`, `libsndfile`, `nxlite`, `d3dx9_31`, `d3dx9_43`), which carry no kind
+prefix; 11 of 11 plug-ins load. `vis_nsfs` loads after the version patch of
+`os_version.rs`, which answers it Windows XP SP3 once, after it refused.
+
+"Loaded" is only the first half. The same run's end-to-end tests drive the real
+player, and `vis_avs` draws a SuperScope preset from the player's own decoded
+audio (`vis_plugin_end_to_end`, screenshot and bright-pixel count in that run's
+`gui-session` directory). The audio and output plug-ins belong to the loopback
+group, which needs the virtual cable and is therefore left out of a general
+`--ignored` pass; that group runs on its own (`-Filter '--ignored:loopback'`) and
+its measurements are kept with the run.
+
