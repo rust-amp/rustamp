@@ -302,6 +302,11 @@ const MAX_FADE_NOTES: usize = 8;
 /// a dead source.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the natural end waits for an output device that still holds audio
+/// after the ring is empty (a classic output plug-in buffers seconds of it).
+/// Longer than any buffer the host opens a plug-in with, so a device whose clock
+/// never arrives cannot hold the player.
+const END_DRAIN_GRACE: Duration = Duration::from_secs(3);
 /// Engine configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineConfig {
@@ -394,6 +399,9 @@ pub struct Engine {
     /// A fade-out that has not finished yet: the counter of the request it
     /// waits for. The transport stops when the ramp is over.
     pending_fade_stop: Option<u64>,
+    /// When the ring first reached the end of the run while the device still
+    /// held audio: the natural end waits for the device, but not without bound.
+    end_drain_since: Option<std::time::Instant>,
     /// The fade reports the caller has not taken yet, oldest first (S18
     /// §2.3; see [`crate::fade_budget`]).
     fade_notes: VecDeque<FadeNote>,
@@ -552,6 +560,7 @@ impl Engine {
             limiter_control: Arc::new(LimiterControl::default()),
             fade_control,
             pending_fade_stop: None,
+            end_drain_since: None,
             fade_notes: VecDeque::new(),
             device_buffer_frames,
             replaygain_control: Arc::new(ReplayGainControl::default()),
@@ -1826,10 +1835,35 @@ impl Engine {
                 self.end_of_stream = Some(cycle_end);
             }
         }
-        if let Some(end) = self.end_of_stream {
+        if let Some(end) = self.end_of_stream
+            && self.transport == TransportState::Playing
+        {
             let (written, consumed) = self.sync.counters();
-            if written >= end && consumed >= end && self.transport == TransportState::Playing {
+            let ring_done = written >= end && consumed >= end;
+            // The ring being empty is not the end of the sound: an output
+            // device - above all a classic output plug-in, which buffers up to
+            // seconds of it - still holds part of the run. The device's own
+            // clock says when the last frame was played, so the run ends when
+            // both agree. A device without a clock counts as playing what it was
+            // given, so this asks nothing of it.
+            let drained = self.output.played_frames() >= end;
+            if ring_done && drained {
                 self.finish_run();
+                self.end_drain_since = None;
+            } else if ring_done || drained {
+                // One of the two is at the end and the other has a moment to
+                // arrive: the device's buffer, or a ring a flush reset at the
+                // end. The bound keeps a device whose clock never arrives from
+                // holding the player.
+                let since = *self
+                    .end_drain_since
+                    .get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= END_DRAIN_GRACE {
+                    self.finish_run();
+                    self.end_drain_since = None;
+                }
+            } else {
+                self.end_drain_since = None;
             }
         }
         self.publish_position(false);
