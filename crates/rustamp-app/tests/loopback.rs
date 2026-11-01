@@ -1565,7 +1565,13 @@ fn out_disk_writes_what_the_engine_renders() {
         let start = Instant::now();
         while engine.transport() != TransportState::Stopped {
             engine.poll().expect("polling the engine");
-            assert!(start.elapsed() < DEADLINE, "the track never finished");
+            assert!(
+                start.elapsed() < DEADLINE,
+                "the track never finished (played {}, end {:?}, device {:?})",
+                engine.played_frames(),
+                engine.end_of_stream(),
+                engine.last_error()
+            );
             std::thread::sleep(PUMP_INTERVAL);
         }
         measurement(&format!(
@@ -1827,7 +1833,10 @@ fn a_pause_reaches_out_wave() {
     assert_eq!(
         engine.transport(),
         TransportState::Stopped,
-        "the track never finished"
+        "the track never finished (played {}, end {:?}, position {:?})",
+        engine.played_frames(),
+        engine.end_of_stream(),
+        engine.position_frames()
     );
 
     // The capture keeps running past the end, as `recorded_through` does.
