@@ -113,7 +113,8 @@ jobs:
             # Portable NSIS, pinned by hash; nothing is installed.
             curl -fsSL -o nsis.zip "https://sourceforge.net/projects/nsis/files/NSIS%203/3.13/nsis-3.13.zip/download"
             echo "ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8  nsis.zip" | sha256sum -c -
-            unzip -q nsis.zip -d "$TEMP"
+            # `tar` is part of Windows itself (bsdtar); `unzip` is not on every image.
+            tar -xf nsis.zip -C "$TEMP"
             export MAKENSIS="$(cygpath -w "$TEMP/nsis-3.13/makensis.exe")"
             version=$(awk '/^\[workspace.package\]/{found=1;next} found && /^\[/{exit} found && /^version = /{gsub(/["\r]/, "", $3); print $3; exit}' Cargo.toml)
             test -n "$version"
