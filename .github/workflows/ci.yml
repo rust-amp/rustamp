@@ -81,22 +81,3 @@ jobs:
 
       - name: Build plugin host (i686)
         run: cargo build -p rustamp-plughost --target i686-pc-windows-msvc
-
-  linux:
-    name: Linux (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install ALSA headers
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
-
-      - name: Check workspace
-        run: cargo check --workspace
