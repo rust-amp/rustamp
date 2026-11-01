@@ -33,7 +33,7 @@ following capabilities and verification still have limitations:
 |---|---|
 | Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope | Real-hardware audio and GPU verification |
 | Playback, seeking, gapless, EQ, volume and balance, and a crossfade of 0 to 30 seconds | A clean-machine install test: CI builds the installer and audits its files, but it has not been installed on a fresh Windows |
-| Classic plug-ins in the separate 32-bit host: input, output, visualization, DSP and general purpose. The test VM runs real ones end to end, see [Classic plug-ins](#classic-plug-ins) | Winamp 5 plug-ins that need the Wasabi APIs (`dsp_sps` refuses the host's header version) |
+| Classic plug-ins in the separate 32-bit host: input, output, visualization, DSP and general purpose. All eleven plug-ins of the Winamp 5.66 installer load, and the end-to-end tests run the real ones — see [Classic plug-ins](#classic-plug-ins) | A general purpose plug-in's own menu entries (IPC 281 answers 0) and the embed flags a visualizer can ask for |
 | MilkDrop 2.25c inside the plug-in host, drawing the player's own audio | A GPU run of MilkDrop 2 (the test VM has no GPU); the player's own MilkDrop window is built but held back from this release (see `docs/HANDOFF.md`) |
 | Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | The remaining measured pixel differences (equalizer curve, paused peak mark, playlist thumb) |
 | Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | |
