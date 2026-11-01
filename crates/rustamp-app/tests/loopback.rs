@@ -1547,6 +1547,11 @@ fn out_disk_writes_what_the_engine_renders() {
     let dll = plugins.join("w566").join("out_disk.dll");
     let started = std::time::SystemTime::now();
     let approvals = approved(dir.path(), &dll);
+    // `out_disk` names its file after the track it is opened for and asks the
+    // host for the title when it starts: without one it has no file to write
+    // and never takes a block.
+    let now_playing = Arc::new(rustamp_app::dsp::NowPlaying::default());
+    now_playing.publish(0, "written tone", &track.display().to_string());
     {
         let mut engine = Engine::new(
             rustamp_decoders::default_registry(),
@@ -1554,7 +1559,7 @@ fn out_disk_writes_what_the_engine_renders() {
                 helper,
                 &dll,
                 &approvals,
-                Default::default(),
+                Arc::clone(&now_playing),
             )),
             EventBus::new(),
             EngineConfig::default(),

@@ -1988,19 +1988,7 @@ impl Engine {
                 });
             }
             DecodeOut::EndOfStreamRevoked => {
-                // A flush takes the end back: a seek re-decodes from another
-                // position, and a device that was reopened has a new timeline.
-                // But a decoder that already *reached* its end has nothing left
-                // to report, and a pause flushes the output without moving the
-                // position - so a revocation that arrives after the end stands
-                // is noise, and dropping the end there left the run playing
-                // forever (`a_pause_reaches_out_wave`).
-                let reached = self
-                    .end_of_stream
-                    .is_some_and(|end| self.position_frames() >= end);
-                if !reached {
-                    self.end_of_stream = None;
-                }
+                self.end_of_stream = None;
             }
             DecodeOut::TrackSkipped { index } => {
                 self.current = Some(index);
