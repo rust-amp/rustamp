@@ -62,7 +62,7 @@ Section
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${PRODUCT}"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "The Rustamp contributors"
-  WriteRegStr HKCU "${UNINST_KEY}" "URLInfoAbout" "https://gitlab.com/rustamp/rustamp"
+  WriteRegStr HKCU "${UNINST_KEY}" "URLInfoAbout" "https://github.com/rust-amp/rustamp"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\rustamp.exe"
   WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'

@@ -1364,7 +1364,7 @@ No configuration file is needed initially. It reads %APPDATA%\Rustamp\rustamp.to
 The helper binaries (rustamp-plughost32.exe, rustamp-dechost-symphonia.exe,
 rustamp-dsphost-stages.exe) are internal background processes, not user entry points.
 No automatic updates: download new versions from
-https://gitlab.com/rustamp/rustamp/-/releases
+https://github.com/rust-amp/rustamp/releases
 
 ## MilkDrop
 
@@ -1456,7 +1456,7 @@ Get-FileHash -Path .\{release_id}.zip -Algorithm SHA256
 ### No Automatic Updates (G6)
 - Rustamp contains **no automatic update checker**, background service, or telemetry.
 - It will never connect to the internet to check for or download updates.
-- To upgrade: Manually download a new release archive from https://gitlab.com/rustamp/rustamp/-/releases.
+- To upgrade: Manually download a new release archive from https://github.com/rust-amp/rustamp/releases.
 - Settings in `%APPDATA%\Rustamp\rustamp.toml` are preserved across manual upgrades.
 
 ## 4. What This Release Can and Cannot Claim
@@ -1484,7 +1484,7 @@ Get-FileHash -Path .\{release_id}.zip -Algorithm SHA256
 Rustamp is clean-room software:
 - Player executables are licensed under **GPL-3.0-or-later** with a **Section 7 Plugin Exception** (`player/PLUGIN-EXCEPTION.md`).
 - Standalone plugin host (`rustamp-plughost32.exe`) is licensed under **MIT OR Apache-2.0** (`host/LICENSE-MIT`, `host/LICENSE-APACHE`).
-- Source Code Offer: In accordance with GPL-3.0 Section 6, complete corresponding source code is available at https://gitlab.com/rustamp/rustamp and released on GitLab.
+- Source Code Offer: In accordance with GPL-3.0 Section 6, complete corresponding source code is available at https://github.com/rust-amp/rustamp and released on GitHub.
 - See `THIRD_PARTY.md` and `player/THIRD_PARTY.md` for complete third-party notices, webamp skin table attribution, static MSVC CRT terms, and dependency inventories.
 "#,
         version = meta.product_version,
@@ -1547,8 +1547,8 @@ fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<Str
          RFC 0004 Section 7 Plugin Exception (`PLUGIN-EXCEPTION.md`).\n\n\
          In accordance with Section 6 of the GNU GPL v3, the complete machine-readable\n\
          Corresponding Source code for this binary distribution is publicly available at:\n\n\
-         - Repository: https://gitlab.com/rustamp/rustamp\n\
-         - Release: https://gitlab.com/rustamp/rustamp/-/releases/v{version}\n\
+         - Repository: https://github.com/rust-amp/rustamp\n\
+         - Release: https://github.com/rust-amp/rustamp/releases/tag/v{version}\n\
          - Commit: {commit}\n\n\
          Recipients may also request the Corresponding Source directly from the maintainers.\n\n\
          ---\n\n\

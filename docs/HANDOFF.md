@@ -1,5 +1,7 @@
 # Handoff: Rustamp project takeover
 
+
+> **Home (2026-11-01):** the project moved to https://github.com/rust-amp/rustamp and GitHub Actions; `github` is the remote to push to, under the `rust-amp` account only. The GitLab project keeps the releases up to 1.2.0.
 > **Live session handover (2026-10-17, late):** see [HANDOFF-SESSION.md](HANDOFF-SESSION.md) - what is merged, what is running (with the job ids), the exact next steps, and the rules this session learned the hard way.
 
 > **1.2.0 release (2026-11-01):** the six lanes of the release wave are merged

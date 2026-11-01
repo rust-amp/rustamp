@@ -3,7 +3,7 @@
 Rustamp is a media player that looks, feels and works like **Winamp 2.95**, on a
 modern backend written in Rust.
 
-![version](https://img.shields.io/badge/version-1.2.0-blue)
+![version](https://img.shields.io/badge/version-1.2.1-blue)
 
 - **Look and feel:** the classic Main, Equalizer and Playlist windows, with
   docking, windowshade, double-size, the original keyboard shortcuts and
@@ -26,7 +26,7 @@ modern backend written in Rust.
 
 ## Status
 
-Version **1.2.0** plays music and supports classic skins and plugins. The
+Version **1.2.1** plays music and supports classic skins and plugins. The
 following capabilities and verification still have limitations:
 
 | Works | Not yet |
@@ -62,14 +62,14 @@ per-user installer that needs no administrator rights.
 ## Download
 
 Releases are built by CI from version tags and published on the
-[releases page](https://gitlab.com/rustamp/rustamp/-/releases). Each release has
+[releases page](https://github.com/rust-amp/rustamp/releases). Each release has
 a portable zip and a per-user installer, each with a `.sha256` file next to it:
 
 ```powershell
 # verify, then unzip anywhere and run rustamp.exe, or run the setup
-(Get-FileHash .\rustamp-1.2.0+*.zip -Algorithm SHA256).Hash
-(Get-FileHash .\rustamp-1.2.0+*-setup.exe -Algorithm SHA256).Hash
-Get-Content .\rustamp-1.2.0+*.zip.sha256
+(Get-FileHash .\rustamp-1.2.1+*.zip -Algorithm SHA256).Hash
+(Get-FileHash .\rustamp-1.2.1+*-setup.exe -Algorithm SHA256).Hash
+Get-Content .\rustamp-1.2.1+*.zip.sha256
 ```
 
 The zip and the installer bundle the 64-bit player, its helper processes, the 32-bit plugin host,
@@ -139,20 +139,19 @@ a failure, which is what CI uses).
 
 ## Continuous integration
 
-[CircleCI](.circleci/config.yml) runs on a Windows executor:
+GitHub Actions runs on Windows runners:
 
-- **every push:** `fmt`, `clippy -D warnings`, the headless tests (the base skin
-  is downloaded from webamp and checked against a pinned SHA-256) and the
+- **every push to `main` and every pull request** ([ci.yml](.github/workflows/ci.yml)):
+  the licence audit, `fmt`, `clippy -D warnings`, the headless tests (the base
+  skin is downloaded from webamp and checked against a pinned SHA-256) and the
   32-bit plugin host build;
-- **every `v*` tag:** the same tests, then `cargo xtask package --release --zip`.
-  The zip and its checksum are stored as CircleCI artifacts, uploaded to the
-  package registry and attached to a GitLab release.
+- **every `v*` tag** ([release.yml](.github/workflows/release.yml)): the same
+  tests, then `cargo xtask package --release --zip --installer`. The files are
+  stored as workflow artifacts and attached to a draft GitHub release, which a
+  maintainer publishes.
 
-To cut a release: bump the workspace version, then `git tag -a v0.1.1 -m "Rustamp 0.1.1"`
-and `git push origin v0.1.1`.
-
-The project settings need `GITLAB_TOKEN` (a token with the `api` scope) and
-`GITLAB_PROJECT_ID` as environment variables.
+To cut a release: bump the workspace version, add `docs/RELEASE-NOTES-<version>.md`,
+then `git tag -a v0.1.1 -m "Rustamp 0.1.1"` and `git push origin v0.1.1`.
 
 ## How the code is organised
 

@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-app"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "cpal",
  "embed-manifest",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-audio"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rtrb",
  "rubato",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "crossbeam-channel",
  "rustamp-plugin-abi",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-dechost"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "rustamp-decoders",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-decoders"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "hound",
  "opus-rs",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-dsp"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "rustamp-proto",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-dsphost"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "rustamp-ipc",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-gfx"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "thiserror 2.0.21",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-ipc"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "crossbeam-channel",
  "postcard",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-library"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "image",
  "rusqlite",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-mediahost"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-ipc",
  "rustamp-proto",
@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-meta"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "lofty",
  "rustamp-core",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-milkdrop"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "crossbeam-channel",
  "image",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-output"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "cpal",
  "rustamp-core",
@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-platform"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "thiserror 2.0.21",
@@ -2566,14 +2566,14 @@ dependencies = [
 
 [[package]]
 name = "rustamp-playlist"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
 ]
 
 [[package]]
 name = "rustamp-plughost"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-ipc",
  "rustamp-mediahost",
@@ -2584,14 +2584,14 @@ dependencies = [
 
 [[package]]
 name = "rustamp-plugin-abi"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rustamp-prefs"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "rustamp-plughost",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-proto"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "postcard",
  "rustamp-plugin-abi",
@@ -2609,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-skin"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "rustamp-gfx",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-testkit"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "png",
  "rustamp-proto",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-ui"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-vis"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-core",
  "rustamp-plugin-abi",
@@ -4427,7 +4427,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xtask"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "rustamp-ipc",
  "rustamp-testkit",

@@ -29,10 +29,10 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
-repository = "https://gitlab.com/rustamp/rustamp"
+repository = "https://github.com/rust-amp/rustamp"
 authors = ["The Rustamp contributors"]
 rust-version = "1.99"
 

@@ -64,7 +64,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test
+      # The original base skin is Winamp's own and is not in this repository.
+      # The acceptance tests load it from webamp's MIT checkout, pinned by hash,
+      # and fail (not skip) if it is missing.
+      - name: Fetch the base-2.91 skin (webamp)
+        shell: bash
+        run: |
+          mkdir -p skins
+          curl -fsSL -o skins/base-2.91.wsz https://raw.githubusercontent.com/captbaritone/webamp/master/packages/webamp/assets/skins/base-2.91.wsz
+          echo "cb2e5361a5208878855ae2c6c4a842df6cb71590b2c4405fe8776258c82e59bb  skins/base-2.91.wsz" | sha256sum -c -
+          echo "RUSTAMP_BASE291_SKIN=$(pwd -W)/skins/base-2.91.wsz" >> "$GITHUB_ENV"
+          echo "RUSTAMP_REQUIRE_BASE291=1" >> "$GITHUB_ENV"
+
+      - name: Test (headless)
         run: cargo test --workspace --all-features
 
       - name: Build plugin host (i686)

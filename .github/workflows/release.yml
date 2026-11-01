@@ -31,6 +31,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # The original base skin is Winamp's own and is not in this repository.
+      # The acceptance tests load it from webamp's MIT checkout, pinned by hash,
+      # and fail (not skip) if it is missing.
+      - name: Fetch the base-2.91 skin (webamp)
+        shell: bash
+        run: |
+          mkdir -p skins
+          curl -fsSL -o skins/base-2.91.wsz https://raw.githubusercontent.com/captbaritone/webamp/master/packages/webamp/assets/skins/base-2.91.wsz
+          echo "cb2e5361a5208878855ae2c6c4a842df6cb71590b2c4405fe8776258c82e59bb  skins/base-2.91.wsz" | sha256sum -c -
+          echo "RUSTAMP_BASE291_SKIN=$(pwd -W)/skins/base-2.91.wsz" >> "$GITHUB_ENV"
+          echo "RUSTAMP_REQUIRE_BASE291=1" >> "$GITHUB_ENV"
+
       # The release must not ship on a red tree: run the same gate as CI.
       - name: Test (headless)
         run: cargo test --workspace --all-features
@@ -58,6 +70,7 @@ jobs:
           ls -l dist
           test -n "$(ls dist/*.zip 2>/dev/null)"
           test -n "$(ls dist/*-setup.exe 2>/dev/null)"
+          echo "notes=docs/RELEASE-NOTES-${GITHUB_REF_NAME#v}.md" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -70,4 +83,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          body_path: ${{ steps.collect.outputs.notes }}
           files: dist/*
