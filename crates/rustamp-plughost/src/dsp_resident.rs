@@ -476,7 +476,6 @@ mod imp {
         /// (`out_wave` opens with two seconds), and a player that keeps sounding
         /// after the pause is what a listener calls broken.
         fn drop_buffered(&mut self) {
-            self.pending.clear();
             if !self.opened {
                 return;
             }
