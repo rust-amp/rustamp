@@ -526,13 +526,15 @@ mod imp {
             // ("resident DSP read timed out").
             let started = std::time::Instant::now();
             let mut written = 0usize;
+            let mut smallest_free = usize::MAX;
             while written < self.bytes.len() {
                 // SAFETY: the plug-in's own callback.
                 let free = unsafe { can_write() } as usize;
+                smallest_free = smallest_free.min(free);
                 if free == 0 {
                     if started.elapsed() >= WRITE_WAIT {
                         return Err(MediaHostError::OperationFailed(format!(
-                            "the output plug-in takes no audio for {} ms",
+                            "the output plug-in takes no audio for {} ms (can_write was {smallest_free} at its smallest)",
                             WRITE_WAIT.as_millis()
                         )));
                     }
@@ -580,14 +582,19 @@ mod imp {
                     title,
                     file,
                 } => {
+                    crate::fault::trace_event(&format!(
+                        "output chain: the track is known before open: {position} {title}"
+                    ));
                     self.next_track = Some((*position, title.clone(), file.clone()));
                     return;
                 }
                 Message::CommandToHost(Command::PausePlugin { .. }) => {
+                    crate::fault::trace_event("output chain: pause");
                     self.set_paused(true);
                     TransportState::Paused
                 }
                 Message::CommandToHost(Command::UnpausePlugin { .. }) => {
+                    crate::fault::trace_event("output chain: unpause");
                     self.set_paused(false);
                     TransportState::Playing
                 }

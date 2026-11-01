@@ -273,6 +273,15 @@ impl OutputDevice for PluginOutput {
     fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
         let (mut stage, link) = crate::dsp::open_helper(&self.config, spec)?;
         stage.prepare(spec)?;
+        // A plug-in may name the file it writes after the track it plays and
+        // asks the host for the title as it *opens* (`out_disk` does): the track
+        // therefore goes to the helper before the first block, not with it. The
+        // pump sends it again with the first block, which the chain treats as
+        // the same track and ignores.
+        let mut seen = 0;
+        if let Some(message) = self.now_playing.message_since(&mut seen) {
+            link.send(message);
+        }
         self.stage = Some(stage);
         self.link = Some(link);
         self.spec = Some(spec);
