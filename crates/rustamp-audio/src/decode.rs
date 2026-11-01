@@ -893,6 +893,10 @@ impl Worker {
             // The traversal order (spec S15) decides what comes next: the
             // permutation and the repeat boundary live in the model the
             // engine shares with this thread.
+            crate::trace_end(&format!(
+                "decode: track outcome {outcome:?}, stop_after_current {}",
+                self.stop_after_current
+            ));
             let next_target = match outcome {
                 Outcome::Ended => self.advance_in_order(),
                 Outcome::SkipNext => self.next_in_order(),
@@ -936,6 +940,7 @@ impl Worker {
             self.crossfade.clear();
             self.pending_skip = None;
         }
+        crate::trace_end(&format!("decode: end_stream at timeline {}", self.timeline));
         let _ = self.tx.send(DecodeOut::EndOfStream {
             timeline_end: self.timeline,
         });

@@ -1531,12 +1531,13 @@ fn out_disk_writes_what_the_engine_renders() {
     use rustamp_app::plugin_output::PluginOutput;
 
     rustamp_app::window::require_test_vm();
-    // SAFETY: as in `the_cable_carries_what_the_winamp5_input_plugins_decode`.
+    // SAFETY: the variables are set before any thread of this test reads them.
     unsafe {
         std::env::set_var(
             "RUSTAMP_HOST_TRACE",
             r"C:\rustamp\out\gui-session\out-disk-trace.txt",
         );
+        std::env::set_var("RUSTAMP_DECODE_TRACE", "1");
     }
     let dir = tempfile::tempdir().unwrap();
     let track = dir.path().join("written tone.wav");
@@ -1785,6 +1786,7 @@ fn a_pause_reaches_out_wave() {
             "RUSTAMP_HOST_TRACE",
             r"C:\rustamp\out\gui-session\pause-trace.txt",
         );
+        std::env::set_var("RUSTAMP_DECODE_TRACE", "1");
     }
     let dir = tempfile::tempdir().unwrap();
     let hz = 1000.0;
@@ -1828,13 +1830,16 @@ fn a_pause_reaches_out_wave() {
 
     engine.set_queue(vec![TrackSource::path(track.clone())]);
     engine.play_index(0).expect("playing through out_wave");
-    // The tone, then a pause of two seconds, then the rest of the track.
+    // The tone, then a pause of two seconds, then the rest of the track. The
+    // tone is six seconds long, so the pump after the resume has to cover what
+    // is left of it (about four and a half seconds) - a shorter one leaves the
+    // transport legitimately playing.
     pump_engine(&mut engine, 1.5, false);
     engine.pause().expect("pausing the cable output");
     measurement("out_wave: paused");
     pump_engine(&mut engine, 2.0, false);
     engine.play().expect("resuming the cable output");
-    pump_engine(&mut engine, 4.0, true);
+    pump_engine(&mut engine, 8.0, true);
     assert_eq!(
         engine.transport(),
         TransportState::Stopped,

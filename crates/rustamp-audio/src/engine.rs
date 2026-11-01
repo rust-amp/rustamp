@@ -1982,12 +1982,14 @@ impl Engine {
                 self.stream_progress = Some(StreamObserver { index, progress });
             }
             DecodeOut::EndOfStream { timeline_end } => {
+                crate::trace_end(&format!("engine: end reported at {timeline_end}"));
                 self.end_of_stream = Some(match self.end_of_stream {
                     Some(existing) => existing.min(timeline_end),
                     None => timeline_end,
                 });
             }
             DecodeOut::EndOfStreamRevoked => {
+                crate::trace_end("engine: end revoked");
                 self.end_of_stream = None;
             }
             DecodeOut::TrackSkipped { index } => {
