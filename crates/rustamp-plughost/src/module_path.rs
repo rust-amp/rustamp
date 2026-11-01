@@ -40,10 +40,12 @@ pub fn forget(base: usize) {
 /// The path noted for `module`, if this host mapped it.
 pub fn path_for(module: *mut c_void) -> Option<PathBuf> {
     let base = module as usize;
-    MAPPED
-        .lock()
-        .ok()
-        .and_then(|mapped| mapped.iter().find(|(known, _)| *known == base).map(|(_, path)| path.clone()))
+    MAPPED.lock().ok().and_then(|mapped| {
+        mapped
+            .iter()
+            .find(|(known, _)| *known == base)
+            .map(|(_, path)| path.clone())
+    })
 }
 
 /// Writes `text` and a terminator into `buffer`, as the wide API does, and
@@ -251,6 +253,9 @@ mod tests {
 
         let mut narrow_room = [0u8; 64];
         let written = answer_narrow(path, &mut narrow_room).expect("the whole path fits");
-        assert_eq!(&narrow_room[..written as usize], path.to_string_lossy().as_bytes());
+        assert_eq!(
+            &narrow_room[..written as usize],
+            path.to_string_lossy().as_bytes()
+        );
     }
 }

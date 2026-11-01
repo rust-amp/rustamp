@@ -732,12 +732,7 @@ mod win {
     /// # Safety
     ///
     /// Win32 passes a message of this frame.
-    unsafe fn frame_message(
-        window: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
+    unsafe fn frame_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // The plug-in decides what closing means: `vis_avs` stops and destroys
         // the frame itself. A frame without a child closes as any window does.
         if message == WM_CLOSE {

@@ -130,6 +130,7 @@ impl Player {
             .arg("90")
             .arg(format!("--control={name}"))
             .env("RUSTAMP_CONFIG", config)
+            .env("RUSTAMP_MILKDROP_DEBUG", "1")
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&stderr).unwrap())
             .stdin(Stdio::null())

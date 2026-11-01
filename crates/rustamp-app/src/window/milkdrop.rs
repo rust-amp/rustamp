@@ -98,6 +98,12 @@ impl Windowed {
         let image = self
             .app
             .render_milkdrop_window((width, height), window.has_focus());
+        if std::env::var_os("RUSTAMP_MILKDROP_DEBUG").is_some() {
+            eprintln!(
+                "milkdrop window: canvas {width}x{height}, frame {:?}",
+                self.app.milkdrop_window().frame_shape()
+            );
+        }
         let Some(surface) = self.milkdrop.surface.as_mut() else {
             return;
         };

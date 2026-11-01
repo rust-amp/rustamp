@@ -214,6 +214,13 @@ impl MilkdropWindow {
         }
     }
 
+    /// The newest frame's size and generation, for the diagnostics of a window
+    /// that stays black (`RUSTAMP_MILKDROP_DEBUG=1`).
+    pub fn frame_shape(&self) -> Option<(u32, u32, u64)> {
+        self.frame()
+            .map(|frame| (frame.width, frame.height, frame.generation))
+    }
+
     /// Identifies what [`MilkdropWindow::render`] would draw: a change means the
     /// window has to be painted.
     pub fn content_key(&self) -> (u64, Option<Status>) {
