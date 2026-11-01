@@ -253,7 +253,6 @@ mod imp {
                     spec,
                     opened: false,
                     bytes: Vec::new(),
-                    pending: Vec::new(),
                     to_main: self.to_main.clone(),
                     next_track: None,
                     file: None,
@@ -351,9 +350,6 @@ mod imp {
         spec: PcmSpecWire,
         opened: bool,
         bytes: Vec<u8>,
-        /// What the plug-in did not take yet. A full buffer must not block this
-        /// thread, because the pause and unpause commands are processed on it.
-        pending: Vec<u8>,
         to_main: Sender<ToMain>,
         /// The track the player named since the last block.
         next_track: Option<(u32, String, String)>,
@@ -392,14 +388,6 @@ mod imp {
     /// How long one block may wait for the plug-in to take any of it before the
     /// write is given up as failed. Longer than any buffer the host asks for.
     const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// How long one block waits for room before it hands the rest to the next
-    /// block. Short, because this thread also processes pause and unpause.
-    const WRITE_SHORT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
-
-    /// How much audio may wait in the chain before a full buffer counts as a
-    /// broken device instead of a slow one: a second of 44.1 kHz stereo.
-    const PENDING_LIMIT: usize = 44_100 * 2 * 2;
 
     impl OutputChain {
         fn open(&mut self) -> Result<()> {
@@ -554,35 +542,33 @@ mod imp {
             // free-space answer stalls the whole audio path: `out_wave` stopped
             // after about a second and `out_disk` never took a block at all
             // ("resident DSP read timed out").
-            //
-            // What the plug-in does not take waits in `pending` instead of
-            // blocking this thread: the pause and unpause commands are processed
-            // here, and a full buffer used to hold them back for seconds.
-            self.pending.extend_from_slice(&self.bytes);
             let started = std::time::Instant::now();
+            let mut written = 0usize;
             let mut smallest_free = usize::MAX;
-            while !self.pending.is_empty() {
+            while written < self.bytes.len() {
                 // SAFETY: the plug-in's own callback.
                 let free = unsafe { can_write() } as usize;
                 smallest_free = smallest_free.min(free);
-                let take = (free.min(self.pending.len()).min(OUTPUT_WRITE_BYTES) / frame) * frame;
-                if take > 0 {
-                    // SAFETY: `take` bytes are readable for this call, and the
-                    // ABI allows the plug-in to touch them.
-                    unsafe { write(self.pending.as_mut_ptr().cast(), take as i32) };
-                    self.pending.drain(..take);
+                if free == 0 {
+                    if started.elapsed() >= WRITE_WAIT {
+                        return Err(MediaHostError::OperationFailed(format!(
+                            "the output plug-in takes no audio for {} ms (can_write was {smallest_free} at its smallest)",
+                            WRITE_WAIT.as_millis()
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
                     continue;
                 }
-                // A buffer that stays full is the device being behind, which is
-                // not this thread's problem to wait out - unless it holds more
-                // than a second of audio, which means something is wrong.
-                if started.elapsed() >= WRITE_WAIT
-                    || (started.elapsed() >= WRITE_SHORT_WAIT
-                        && self.pending.len() <= PENDING_LIMIT)
-                {
-                    break;
+                let take =
+                    free.min(self.bytes.len() - written).min(OUTPUT_WRITE_BYTES) / frame * frame;
+                if take == 0 {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                // SAFETY: `take` bytes from `written` on are readable for this
+                // call, and the ABI allows the plug-in to touch them.
+                unsafe { write(self.bytes.as_mut_ptr().add(written).cast(), take as i32) };
+                written += take;
             }
             Ok(())
         }
@@ -590,9 +576,6 @@ mod imp {
         fn reset(&mut self) {
             self.read_clock();
             self.clock.start_over();
-            // A flush drops what the plug-in did not take yet, like the
-            // plug-in's own buffer.
-            self.pending.clear();
             // SAFETY: a live module; the callbacks run on this thread.
             let module = unsafe { &*self.module };
             if self.opened
