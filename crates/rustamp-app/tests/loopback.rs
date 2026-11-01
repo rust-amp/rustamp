@@ -1527,6 +1527,24 @@ fn the_output_plugins_play_what_the_engine_renders() {
     // The whole tone, not only enough of it for a level: a clock that counts
     // blocks handed over ends the track while the plug-in holds its end.
     let held = windows_holding(&mono, rate, hz);
+    // Where the tone is, window by window: `#` holds, `.` does not. A missing
+    // stretch says whether the start or the end was lost.
+    let window = (f64::from(rate) * EQ_WINDOW_SECONDS).round() as usize;
+    let pattern: String = mono
+        .chunks_exact(window)
+        .map(|chunk| {
+            let (amplitude, ratio) = tone_in_window(chunk, f64::from(rate), hz);
+            if ratio >= MIN_TONE_RATIO && amplitude > 0.001 {
+                '#'
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    measurement(&format!(
+        "out_wave: {pattern} ({} windows of {EQ_WINDOW_SECONDS} s)",
+        pattern.len()
+    ));
     measurement(&format!("out_wave: {held} windows hold the tone"));
     assert!(held >= 8, "only {held} of 9 windows hold the {hz} Hz tone");
     let through = decibels(level_of(&mono, rate, hz), plain);
