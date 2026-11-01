@@ -1034,6 +1034,12 @@ impl<R: MappedRegion> RingConsumer<R> {
                 return Ok(count);
             }
             if self.is_closed() {
+                // The peer may have published and closed since `write_seq` was
+                // read. The close comes after its last frame, so a second look
+                // now sees every frame there will ever be.
+                if self.write_seq(Ordering::Acquire) != read_seq {
+                    continue;
+                }
                 return Err(RingError::Closed);
             }
             match wake.wait(Wake::Data, timeout)? {
