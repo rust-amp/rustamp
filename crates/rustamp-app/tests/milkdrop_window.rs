@@ -174,7 +174,15 @@ fn write_config(dir: &Path, preset_folder: Option<&Path>) -> PathBuf {
 /// `empty_presets` configures a preset folder that holds no preset;
 /// `expected_note` is the part of the `MilkDrop:` note the case must find on
 /// stderr; `shot` names the screenshot kept as evidence.
+/// The MilkDrop window is a real window on the test VM's single desktop and the
+/// picture is read back from a copy of that screen area. Two cases at once would
+/// photograph each other's windows, so the cases run one after the other.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_case(label: &str, empty_presets: bool, expected_note: &str, shot: &str) {
+    let _serial = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     rustamp_app::window::require_test_vm();
     let out = PathBuf::from(r"C:\rustamp\out\gui-session");
     let _ = std::fs::create_dir_all(&out);

@@ -34,6 +34,12 @@ unsafe extern "system" {
     fn PostMessageW(hwnd: *mut std::ffi::c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
 }
 
+/// A plug-in's window is a real window on the test VM's single desktop, and the
+/// picture is read back from a screenshot of that desktop. Two cases at once
+/// would photograph each other's windows and time each other out, so the cases
+/// of this binary run one after the other.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn testplugins() -> PathBuf {
     std::env::var_os("RUSTAMP_TESTPLUGINS")
         .map(PathBuf::from)
@@ -250,6 +256,9 @@ fn the_player_runs(
     shot: &str,
     preset_frame: Option<&str>,
 ) {
+    let _serial = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     rustamp_app::window::require_test_vm();
     let out = PathBuf::from(r"C:\rustamp\out\gui-session");
     let _ = std::fs::create_dir_all(&out);
@@ -411,21 +420,55 @@ fn the_player_runs(
         );
         assert!(stopped, "player said: {}", tail(&stderr_path, 6));
         if preset_frame.is_some() {
-            // The picture: the frame sits at the top left of the screen, and a
-            // scope's line is white on black.
+            // The picture: the plug-in's window sits where the frame put it and
+            // the frame draws its own chrome around the plug-in's area. Sample
+            // inside that area rather than at a fixed place on the screen, or a
+            // skinned title bar's tiles count as a picture and a black window
+            // passes. The margins are the frame's chrome: 20 px of side rail and
+            // 42 px of title bar.
+            let host_pid: u32 = powershell(
+                &format!(
+                    "(Get-Process -Name rustamp-plughost32 -ErrorAction SilentlyContinue | \
+                     Where-Object {{ $_.MainWindowTitle -like '*{title_part}*' }} | \
+                     Select-Object -First 1 -ExpandProperty Id)"
+                ),
+                15,
+            )
+            .trim()
+            .parse()
+            .unwrap_or(0);
+            let frame = child_windows::find_window(host_pid, title_part, Duration::from_secs(15));
+            assert!(
+                !frame.is_null(),
+                "no {title_part} frame: host pid {host_pid}, windows {title:?}"
+            );
+            let (win_left, win_top, win_right, win_bottom) = child_windows::outer_rect(frame);
+            let (x0, y0) = (win_left + 20, win_top + 42);
+            let (x1, y1) = (win_right - 20, win_bottom - 20);
+            assert!(
+                x1 > x0 && y1 > y0,
+                "the {title_part} frame is too small to hold a picture: {win_left},{win_top}-{win_right},{win_bottom}"
+            );
             let bright = powershell(
                 &format!(
                     "Add-Type -AssemblyName System.Drawing; \
                      $b = New-Object System.Drawing.Bitmap '{}'; $n = 0; \
-                     for ($y = 70; $y -lt 295; $y += 1) {{ for ($x = 45; $x -lt 355; $x += 1) {{ \
+                     for ($y = {y0}; $y -lt {y1}; $y += 1) {{ for ($x = {x0}; $x -lt {x1}; $x += 1) {{ \
                      if ($b.GetPixel($x,$y).GetBrightness() -gt 0.2) {{ $n++ }} }} }}; $n",
                     png.display()
                 ),
                 60,
             );
-            note(&mut report, &out, format!("bright pixels: {bright}"));
+            note(
+                &mut report,
+                &out,
+                format!("the plug-in's own area is {x0},{y0}-{x1},{y1}; bright pixels: {bright}"),
+            );
             let bright: u32 = bright.trim().parse().unwrap_or(0);
-            assert!(bright > 50, "{plugin} drew nothing: {bright} bright pixels");
+            assert!(
+                bright > 50,
+                "{plugin} drew nothing: {bright} bright pixels in its own area"
+            );
         }
         assert!(
             rendering,

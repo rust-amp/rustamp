@@ -182,7 +182,7 @@ fn vis_avs_draws_in_a_frame_from_the_sheet() {
         .expect("AVS asked for no frame: the host created none");
     // SAFETY: the frame is ours and alive for as long as the module runs.
     let style = unsafe { GetWindowLongW(frame, GWL_STYLE) } as u32;
-    assert_ne!(
+    assert_eq!(
         style & WS_POPUP.0,
         WS_POPUP.0,
         "the frame does not draw itself from the sheet: it carries a system frame"
