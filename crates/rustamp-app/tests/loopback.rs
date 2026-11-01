@@ -344,6 +344,19 @@ fn start_capture(
     format: cpal::SampleFormat,
     recording: &Arc<Mutex<Recording>>,
 ) -> cpal::Stream {
+    start_capture_tolerating(device, config, format, recording, MAX_TOLERATED_XRUNS)
+}
+
+/// Starts recording, tolerating `max_xruns` buffer underrun/overruns. A case
+/// that silences the source on purpose (a pause) makes the capture underrun by
+/// design and says so.
+fn start_capture_tolerating(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    recording: &Arc<Mutex<Recording>>,
+    max_xruns: usize,
+) -> cpal::Stream {
     let on_error = {
         let recording = Arc::clone(recording);
         move |e: cpal::Error| {
@@ -354,10 +367,10 @@ fn start_capture(
                         r.first_xrun = Some(e.to_string());
                     }
                     let count = r.xrun_count;
-                    if count > MAX_TOLERATED_XRUNS {
+                    if count > max_xruns {
                         r.fatal_error.get_or_insert_with(|| {
                             format!(
-                                "too many buffer underrun/overruns ({count} > {MAX_TOLERATED_XRUNS}): {e}"
+                                "too many buffer underrun/overruns ({count} > {max_xruns}): {e}"
                             )
                         });
                     }
@@ -1819,7 +1832,7 @@ fn a_pause_reaches_out_wave() {
     let rate = config.sample_rate;
     let channels = usize::from(config.channels);
     let recording = Arc::new(Mutex::new(Recording::default()));
-    let stream = start_capture(&capture, config, format, &recording);
+    let stream = start_capture_tolerating(&capture, config, format, &recording, 4);
     let pre_roll = (f64::from(rate) * PRE_ROLL.as_secs_f64()) as usize;
     let start = Instant::now();
     while recorded_frames(&recording, channels) < pre_roll {

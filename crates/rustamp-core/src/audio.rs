@@ -376,6 +376,24 @@ pub trait OutputDevice: Send {
     /// Current output latency (time between a frame being rendered and heard).
     fn latency(&self) -> Duration;
 
+    /// Whether [`OutputDevice::played_frames`] answers what has *been heard*
+    /// rather than what the device was handed. A backend whose clock only mirrors
+    /// its input (a classic output plug-in answers `getoutputtime` with the
+    /// position of the write cursor) says `false`.
+    fn reports_played_position(&self) -> bool {
+        true
+    }
+
+    /// How long the device still needs after the ring is empty until everything
+    /// it was handed has been heard. The natural end of a run waits this long, so
+    /// a device that buffers seconds of audio does not lose its tail.
+    ///
+    /// Default: the device's own latency, which is right for a backend that
+    /// reports the time between rendering and hearing it.
+    fn drain_time(&self) -> Duration {
+        self.latency()
+    }
+
     /// Total frames consumed by the device since `start` (the audio clock).
     /// Used for position display. Not reset by `flush`.
     fn played_frames(&self) -> u64;

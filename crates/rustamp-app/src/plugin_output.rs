@@ -40,6 +40,9 @@ const BLOCK_FRAMES: usize = 576;
 /// How far ahead of real time the thread may run: the plug-in's buffer fills
 /// first, so a stutter of the helper does not reach the output at once.
 const AHEAD: Duration = Duration::from_millis(250);
+/// How long the end of a run waits for a plug-in's own buffer: longer than the
+/// two seconds `out_wave` opens with.
+const PLUGIN_DRAIN: Duration = Duration::from_millis(2_500);
 /// Bounds the wait for the player to name the track before the first block.
 const TRACK_WAIT: Duration = Duration::from_secs(1);
 /// How far the clock may fall behind the blocks handed over: more than any
@@ -317,6 +320,20 @@ impl OutputDevice for PluginOutput {
 
     fn latency(&self) -> Duration {
         AHEAD
+    }
+
+    fn drain_time(&self) -> Duration {
+        // A classic output plug-in buffers far more than the pacing window:
+        // `out_wave` reports "latency 2000" when it opens. The end of a run
+        // waits for that buffer, so the last second of a track is not thrown
+        // away with it.
+        PLUGIN_DRAIN
+    }
+
+    fn reports_played_position(&self) -> bool {
+        // The plug-in's `getoutputtime` answers with the write cursor, not with
+        // what has been heard: the drain time is what ends a run here.
+        false
     }
 
     fn played_frames(&self) -> u64 {

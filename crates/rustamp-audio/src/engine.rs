@@ -1840,25 +1840,23 @@ impl Engine {
         {
             let (written, consumed) = self.sync.counters();
             let ring_done = written >= end && consumed >= end;
-            // The ring being empty is not the end of the sound: an output
-            // device - above all a classic output plug-in, which buffers up to
-            // seconds of it - still holds part of the run. The device's own
-            // clock says when the last frame was played, so the run ends when
-            // both agree. A device without a clock counts as playing what it was
-            // given, so this asks nothing of it.
             let drained = self.output.played_frames() >= end;
-            if ring_done && drained {
-                self.finish_run();
-                self.end_drain_since = None;
-            } else if ring_done || drained {
-                // One of the two is at the end and the other has a moment to
-                // arrive: the device's buffer, or a ring a flush reset at the
-                // end. The bound keeps a device whose clock never arrives from
-                // holding the player.
+            if ring_done || drained {
+                let drain = self.output.drain_time().min(END_DRAIN_GRACE);
                 let since = *self
                     .end_drain_since
                     .get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() >= END_DRAIN_GRACE {
+                // The ring being empty is not the end of the sound: the device
+                // still holds part of the run. When its clock says what has been
+                // *heard*, that is the answer. When it only mirrors its input (a
+                // classic output plug-in buffers up to two seconds and answers
+                // with the write position), only the drain time is.
+                let done = if self.output.reports_played_position() {
+                    drained && (ring_done || since.elapsed() >= END_DRAIN_GRACE)
+                } else {
+                    since.elapsed() >= drain
+                };
+                if done {
                     self.finish_run();
                     self.end_drain_since = None;
                 }
