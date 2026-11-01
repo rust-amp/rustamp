@@ -50,7 +50,13 @@ impl Windowed {
             self.milkdrop.painted = None;
         }
         if self.milkdrop.painted.as_ref() != Some(&self.app.milkdrop_window().content_key()) {
-            self.paint_milkdrop();
+            // Painted from the redraw event, never from the tick: presenting a
+            // frame on a window whose display never refreshes (the test VM has
+            // no monitor) waits for a vertical blank that never comes, and the
+            // tick would stop with it.
+            if let Some(window) = &self.milkdrop.window {
+                window.request_redraw();
+            }
         }
     }
 

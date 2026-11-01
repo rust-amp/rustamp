@@ -21,8 +21,13 @@ MilkDrop window of our own, and ships an installer next to the portable zip.
     player's skinned frame (`gen.bmp`) instead of the system caption.
   - A file named on the command line, `/ADD`, and the plug-in's own requests for
     the current track all reach the host the same way.
-- Verified in the test VM against the real Winamp 5.66 plug-ins:
-  <!-- VM: list from the acceptance run, filled in after the run -->
+- Verified in the test VM against the real Winamp 5.66 plug-ins: all eleven load
+  and name their descriptions, and the end-to-end tests drive them through the
+  player — `in_wave`, `in_flac`, `in_vorbis`, `out_wave`, `out_disk`, the
+  Optilab DSP, `vis_avs` (2.82), `vis_milk2` (MilkDrop 2.25c) and
+  `vis_chavs` (Cockos Happy AVS, both EEL generations) each start, draw or play
+  in the real player. The table is in
+  [docs/notes/real-plugin-survey.md](notes/real-plugin-survey.md).
 
 ## MilkDrop
 
