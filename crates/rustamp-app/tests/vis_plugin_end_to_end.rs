@@ -426,12 +426,14 @@ fn the_player_runs(
             // skinned title bar's tiles count as a picture and a black window
             // passes. The margins are the frame's chrome: 20 px of side rail and
             // 42 px of title bar.
+            // The frame belongs to the plug-in host, and the host's process is
+            // the only one a running case has. The title is not used to pick it:
+            // `MainWindowTitle` is empty until Windows decides which window is
+            // the process's main one, which raced with the screenshot.
             let host_pid: u32 = powershell(
-                &format!(
-                    "(Get-Process -Name rustamp-plughost32 -ErrorAction SilentlyContinue | \
-                     Where-Object {{ $_.MainWindowTitle -like '*{title_part}*' }} | \
-                     Select-Object -First 1 -ExpandProperty Id)"
-                ),
+                "(Get-Process -Name rustamp-plughost32 -ErrorAction SilentlyContinue | \
+                 Sort-Object StartTime -Descending | \
+                 Select-Object -First 1 -ExpandProperty Id)",
                 15,
             )
             .trim()
