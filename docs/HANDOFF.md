@@ -55,6 +55,19 @@ Status as of **2026-10-15**, after the second session (OpenCode orchestrator): l
 ---
 
 ## 1. What this project is
+>
+> **Open defect measured in the same acceptance run (2026-11-01):** the
+> `loopback` group runs only on its own (`-Filter '--ignored:loopback'`, it needs
+> the virtual cable) and there 9 of 12 cases pass. The three that fail are the
+> end of a track through an output plug-in: `the_output_plugins_play_what_the_engine_renders`
+> (only 3 of 9 windows hold the tone, `played 44254` then `18654` frames of a
+> 2 s tone), `out_disk_writes_what_the_engine_renders` and
+> `a_pause_reaches_out_wave` (both "the track never finished": the transport
+> stays `Playing`). Everything else on the cable passes, including the crossfade,
+> `in_openmpt`, `dsp_sps`, the equalizer and the 5.66 input decoders. The clock
+> in `plugin_output.rs` (`PlayClock::played`, `CLOCK_SLACK` = 10 s) is where to
+> look: the slack is larger than the test's whole tone, so the floor
+> `handed - slack` never lifts the clock to the end.
 
 **Rustamp** is a new media player that looks, feels and behaves like **Winamp 2.95** on Windows, built in **Rust** on modern technology.
 

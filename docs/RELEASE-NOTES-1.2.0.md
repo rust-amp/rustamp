@@ -11,9 +11,12 @@ MilkDrop window of our own, and ships an installer next to the portable zip.
   down. What changed is what they get:
   - The audio helpers are told which track plays, and a pause reaches the output
     plug-in, not only the engine.
-  - An output plug-in's own clock now sets how much of a track the engine counts
-    as played, so the end of a track is no longer cut off when the plug-in still
-    holds audio.
+  - An output plug-in's own clock reports how much of a track it has played, so
+    the end of a track is not cut off when the plug-in still holds audio.
+    **Known limitation, measured in the test VM:** three cases still fail - with
+    out_wave and out_disk the engine does not reach the end of the track, and
+    only part of the tone arrives (loopback: 9 of 12 cases pass; the three
+    end-of-track cases fail, see docs/HANDOFF.md).
   - A DSP plug-in's configuration dialog opens in the instance that actually
     processes the audio, and a DSP library's second and later modules can be
     chosen and are kept in the configuration.
@@ -73,8 +76,16 @@ says it is unsigned.
 
 ## Known limitations
 
+- **Output plug-ins do not reach the end of a track yet.** With `out_wave` and
+  `out_disk` the engine stays in `Playing` and part of the tone never arrives
+  (three of the twelve `loopback` cases; the rest pass). The player's own
+  output, every input plug-in, the DSP path, AVS and MilkDrop 2 are unaffected.
+- The player's own MilkDrop window is built but not part of this release (see
+  above and `docs/HANDOFF.md`).
 - The binaries are unsigned; Windows SmartScreen may warn on first start.
 - There is no auto-update.
 - Real-hardware audio and GPU rendering are not verified; the acceptance runs
   use the test VM's virtual cable and software adapters.
 - <!-- VM: remaining measured differences, filled in after the acceptance run -->
+
+
