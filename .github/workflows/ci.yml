@@ -77,7 +77,7 @@ jobs:
           echo "RUSTAMP_REQUIRE_BASE291=1" >> "$GITHUB_ENV"
 
       - name: Test (headless)
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --no-fail-fast
 
       - name: Build plugin host (i686)
         run: cargo build -p rustamp-plughost --target i686-pc-windows-msvc
@@ -94,6 +94,9 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
       - name: Check workspace
         run: cargo check --workspace

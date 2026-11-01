@@ -2726,8 +2726,10 @@ impl App {
     /// publisher the playlist contract names: "the owner mutates it and
     /// publishes `PlaylistChanged` events". A local control client waits on
     /// this event (or on the snapshot) to confirm that a `cmd` it sent was
-    /// applied, instead of sleeping and re-reading the state.
-    fn publish_playlist_change(&self, kind: PlaylistChangeKind) {
+    /// applied, instead of sleeping and re-reading the state, so the snapshot
+    /// is refreshed first: the end of the pump would come after the client read.
+    fn publish_playlist_change(&mut self, kind: PlaylistChangeKind) {
+        self.update_control_snapshot();
         self.bus.publish(Event::PlaylistChanged {
             kind,
             len: self.engine.queue().len() as u32,
@@ -6027,6 +6029,24 @@ mod tests {
         app.submit(Command::Quit).unwrap();
         let events: Vec<Event> = observer.try_iter().collect();
         assert!(events.contains(&Event::Quit), "{events:?}");
+    }
+
+    #[test]
+    fn the_snapshot_agrees_with_a_playlist_event_when_it_is_published() {
+        let (mut app, _dir) = app_with_file(None);
+        let observer = app.bus.subscribe();
+        app.submit(Command::AddItems {
+            items: vec![MediaLocation::Url("http://127.0.0.1/stream.mp3".to_owned())],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        assert!(
+            observer
+                .try_iter()
+                .any(|event| matches!(event, Event::PlaylistChanged { len: 1, .. }))
+        );
+        assert_eq!(app.control_state.lock().unwrap().playlist_len, 1);
     }
 
     #[test]

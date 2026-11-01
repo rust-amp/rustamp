@@ -6,6 +6,8 @@ no audio, window or plug-in code.
 - The project moved to GitHub: https://github.com/rust-amp/rustamp. The links in
   the installer, the bundled documents and the source offer point there.
 - Releases are built by GitHub Actions.
+- A control client that reads the snapshot right after a playlist event now sees
+  the change; it could read the state from before it.
 
 The list of what works, and of what 1.2.0 does not do, is in the
 [1.2.0 notes](RELEASE-NOTES-1.2.0.md) and holds for this release.
