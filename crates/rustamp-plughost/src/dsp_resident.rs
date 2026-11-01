@@ -483,6 +483,24 @@ mod imp {
             }
         }
 
+        /// Drops what the plug-in still holds, so a pause is heard at once.
+        /// The plug-in's own `pause` does not stop a buffer it already plays
+        /// (`out_wave` opens with two seconds), and a player that keeps sounding
+        /// after the pause is what a listener calls broken.
+        fn drop_buffered(&mut self) {
+            self.pending.clear();
+            if !self.opened {
+                return;
+            }
+            // SAFETY: a live module; the callback runs on the thread that writes.
+            if let Some(flush) = unsafe { (*self.module).flush } {
+                // SAFETY: the plug-in's own callback; 0 restarts its clock at
+                // the current position, which the host does not read for an
+                // output.
+                unsafe { flush(0) };
+            }
+        }
+
         /// A new file closes the plug-in for the old one. The main thread takes
         /// the track before the plug-in is opened and reads it.
         fn take_next_track(&mut self) {
@@ -611,6 +629,11 @@ mod imp {
                         self.played_ms()
                     ));
                     self.set_paused(true);
+                    // A paused plug-in that keeps playing its buffer is heard as
+                    // a player that ignores the pause: `out_wave` opens with two
+                    // seconds and does exactly that. The pause therefore drops
+                    // what it holds, so the cable is silent from the command on.
+                    self.drop_buffered();
                     TransportState::Paused
                 }
                 Message::CommandToHost(Command::UnpausePlugin { .. }) => {
