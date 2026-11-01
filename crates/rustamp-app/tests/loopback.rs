@@ -1861,14 +1861,16 @@ fn a_pause_reaches_out_wave() {
 
     engine.set_queue(vec![TrackSource::path(track.clone())]);
     engine.play_index(0).expect("playing through out_wave");
-    // The tone, then a pause of two seconds, then the rest of the track. The
+    // The tone, then a pause of four seconds, then the rest of the track. The
     // tone is six seconds long, so the pump after the resume has to cover what
     // is left of it (about four and a half seconds) - a shorter one leaves the
     // transport legitimately playing.
     pump_engine(&mut engine, 1.5, false);
     engine.pause().expect("pausing the cable output");
-    measurement("out_wave: paused");
-    pump_engine(&mut engine, 2.0, false);
+    // The pause is longer than the plug-in's own buffer: `out_wave` opens with
+    // two seconds and keeps playing what it holds, so only a longer pause
+    // leaves a silence the cable can see.
+    pump_engine(&mut engine, 4.0, false);
     engine.play().expect("resuming the cable output");
     pump_engine(&mut engine, 8.0, true);
     assert_eq!(
