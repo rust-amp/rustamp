@@ -37,12 +37,9 @@ use crate::dsp::{HelperLink, NowPlaying};
 
 /// Frames handed over at once: the classic block.
 const BLOCK_FRAMES: usize = 576;
-/// How far ahead of real time the thread may run. It is what fills the plug-in's
-/// own buffer, and that buffer is what covers a stutter of the helper: a quarter
-/// second left the cable underrunning mid-tone (`....####....###` in the
-/// capture), so the thread runs a second ahead, within `out_wave`'s two-second
-/// buffer.
-const AHEAD: Duration = Duration::from_millis(1_000);
+/// How far ahead of real time the thread may run: the plug-in's buffer fills
+/// first, so a stutter of the helper does not reach the output at once.
+const AHEAD: Duration = Duration::from_millis(250);
 /// How long the end of a run waits for a plug-in's own buffer: the two seconds
 /// `out_wave` opens with, plus the quarter second this thread is paced ahead of
 /// real time, plus a margin. The engine caps the wait at three seconds anyway.
