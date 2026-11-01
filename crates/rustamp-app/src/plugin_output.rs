@@ -252,6 +252,14 @@ fn pump(
         }
         render(&mut block);
         if let Err(error) = stage.process(&mut block) {
+            // A paused plug-in may refuse audio until it is unpaused (its buffer
+            // is full and it is not playing). That is not a failed output: the
+            // thread has to stay alive to carry the unpause command, which is
+            // what tells the plug-in to go on.
+            if shared.paused.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             if let Ok(mut slot) = shared.error.lock() {
                 *slot = Some(error.to_string());
             }
