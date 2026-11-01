@@ -324,13 +324,13 @@ fn run_case(label: &str, empty_presets: bool, expected_note: &str, shot: &str) {
 }
 
 #[test]
-#[ignore = "VM-only: opens the player's MilkDrop window; run in the headless test VM"]
+#[ignore = "held back from 1.2.0: with the window open the player stops its tick after one or two paints, so the picture never arrives (docs/HANDOFF.md, 2026-11-01)"]
 fn the_player_opens_the_milkdrop_window_and_renders_a_preset() {
     run_case("builtin", false, "preset:", "milkdrop-window.png");
 }
 
 #[test]
-#[ignore = "VM-only: opens the player's MilkDrop window; run in the headless test VM"]
+#[ignore = "held back from 1.2.0: with the window open the player stops its tick after one or two paints, so the picture never arrives (docs/HANDOFF.md, 2026-11-01)"]
 fn an_empty_preset_folder_keeps_the_window_up_with_its_message() {
     run_case(
         "empty",

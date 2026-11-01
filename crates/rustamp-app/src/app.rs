@@ -3739,6 +3739,11 @@ impl App {
     }
 
     /// Opens or closes the player's own MilkDrop.
+    ///
+    /// Not reachable in 1.2.0: [`Command::ToggleWindow`] answers with a note
+    /// instead (see the arm below), because with the window open the player's
+    /// tick stops after one or two paints. Kept for the release that fixes it.
+    #[allow(dead_code)]
     fn toggle_milkdrop_window(&mut self) {
         if self.milkdrop_window.is_open() {
             self.close_milkdrop_window();
@@ -4288,7 +4293,16 @@ impl App {
                 self.toggle_library();
             }
             C::ToggleWindow(window) if *window == crate::milkdrop_window::MILKDROP_WINDOW_ID => {
-                self.toggle_milkdrop_window();
+                // Not part of 1.2.0: with the window open the player's tick
+                // stops after one or two paints, so the picture never arrives
+                // (docs/HANDOFF.md, 2026-11-01). MilkDrop 2 itself runs in the
+                // plug-in host, which is the visualization this release ships.
+                let _ = window;
+                self.note(
+                    "the player's own MilkDrop window is not part of this release; \
+                     MilkDrop 2 runs as a plug-in (Visualization > Start/Stop plug-in)"
+                        .to_string(),
+                );
             }
             C::ToggleWindow(window) => {
                 self.note(format!(

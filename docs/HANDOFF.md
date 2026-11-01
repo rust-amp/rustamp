@@ -14,6 +14,41 @@
 > relative `--out` was the one case that failed until `package.rs` handed
 > makensis absolute paths. The VM acceptance run and the remaining open points
 > are recorded at the end of this section as they are measured.
+>
+> **What the acceptance run proved (2026-11-01, `base-provisioned-cable`):** the
+> whole `--ignored` suite ran 172 binaries. `vis_plugin_end_to_end` passed all
+> four cases - AVS 2.82, Cockos Happy AVS with both EEL generations, and MilkDrop
+> 2.25c - each drawing a preset from the player's own audio; `helper_acceptance`
+> proved the skinned frame and that `vis_nsfs` loads; `gpu_render` passed 7/7 on
+> the software adapter; the survey loaded 11 of 11 plug-ins.
+>
+> **Two defects the run found and this session fixed:**
+>
+> 1. **Cockos Happy AVS drew black.** Its instrumented build showed valid
+>    152x103 surfaces, `render` every frame and `nonzero 0` forever, with no
+>    preset effect ever compiled. Cause: `init` derives its own folder with
+>    `GetModuleFileName(hDllInstance)` and reads `<folder>\vis_avs.dat`, and the
+>    host **maps the image itself**, so the image is not in the loader's module
+>    list and the system cannot name it. `module_path.rs` notes each mapped
+>    image and points the image's `GetModuleFileNameA/W` slots at that answer;
+>    with it the log shows `compile 0 [...] -> 0x03AF0050` and
+>    `rendered ... nonzero 600 of 15656`.
+> 2. **MilkDrop 2.25c killed the plug-in host in `init`.** The host died after
+>    the track announcement, before `-> init` was logged. A panic that unwinds
+>    through a window procedure aborts the process, so the embed frame's
+>    procedure now catches one (`catch_unwind`) and answers with the default
+>    handling. With that, MilkDrop draws.
+>
+> **Held back from 1.2.0: the player's own MilkDrop window.** Its engine renders
+> offscreen (7/7 `gpu_render` tests), but with the window open the player's tick
+> stops after one or two paints: the diagnostics print `canvas 640x500, frame
+> None` and then nothing, and the body is black while the title bar paints. The
+> paint was moved from the tick to `RedrawRequested` (presenting from the tick
+> waits for a vertical blank the VM's display never sends); the symptom stayed.
+> `Command::ToggleWindow(WindowId::Vis)` therefore answers with a note, its two
+> VM tests carry `#[ignore]` with that reason, and the release notes say so. The
+> next session starts there: the open question is why the tick stops with that
+> window open, not whether the engine renders.
 
 Status as of **2026-10-15**, after the second session (OpenCode orchestrator): lanes A (audio engine), C (skin/gfx), D (main window and its behaviour), E (playlist I/O), G (shared-memory rings) and L (licensing split) are integrated on `main`; S01, S02, S03 and S17 are audited. This document is everything a new agent needs to continue the work. Read it completely before you do anything.
 

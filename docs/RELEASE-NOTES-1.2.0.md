@@ -31,9 +31,16 @@ MilkDrop window of our own, and ships an installer next to the portable zip.
 
 ## MilkDrop
 
-`rustamp-milkdrop` renders MilkDrop presets on the `lactea` engine and has its
-own window (Visualization menu, `Alt+D`) with next/previous/random, timed and
-random preset changes, folder textures, and a CPU-readable frame for the tests.
+**MilkDrop 2.25c runs inside the plug-in host** and is verified end to end in the
+test VM: the player's own decoded audio feeds it, it draws a live preset, and its
+window carries the player's skinned frame.
+
+The player's **own** MilkDrop window (`rustamp-milkdrop` on the `lactea` engine,
+Visualization menu and `Alt+D`) is built and its engine renders offscreen in the
+tests, but it is **not part of this release**: in the test VM the player stops
+its tick after the window's first paint, so the picture never arrives. The
+command answers with a note that names the plug-in path instead. The evidence
+and the open symptom are in [docs/HANDOFF.md](HANDOFF.md).
 
 ## Crossfade and Preferences
 

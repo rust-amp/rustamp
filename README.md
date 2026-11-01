@@ -18,8 +18,9 @@ modern backend written in Rust.
   purpose plugins run in a separate 32-bit helper process
   (`rustamp-plughost`), so a crashing plugin cannot take the player down. The
   loader works with our own fixtures, `in_openmpt` and one third-party DSP;
-  Winamp 5.x plug-ins load, and the player runs MilkDrop 2.25c end to end in the
-  test VM (see Status below for the limits).
+  all eleven plug-ins of the Winamp 5.66 installer load, and the player runs
+  MilkDrop 2.25c and AVS end to end in the test VM (see Status below for the
+  limits).
 - **Platforms:** Windows first. Linux and macOS come later, with classic plugins
   under Wine.
 
@@ -33,7 +34,7 @@ following capabilities and verification still have limitations:
 | Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope | Real-hardware audio and GPU verification |
 | Playback, seeking, gapless, EQ, volume and balance, and a crossfade of 0 to 30 seconds | A clean-machine install test: CI builds the installer and audits its files, but it has not been installed on a fresh Windows |
 | Classic plug-ins in the separate 32-bit host: input, output, visualization, DSP and general purpose. The test VM runs real ones end to end, see [Classic plug-ins](#classic-plug-ins) | Winamp 5 plug-ins that need the Wasabi APIs (`dsp_sps` refuses the host's header version) |
-| MilkDrop: our own window on the `lactea` engine, and MilkDrop 2 inside the plug-in host | A GPU run of MilkDrop 2 (the test VM has no GPU) |
+| MilkDrop 2.25c inside the plug-in host, drawing the player's own audio | A GPU run of MilkDrop 2 (the test VM has no GPU); the player's own MilkDrop window is built but held back from this release (see `docs/HANDOFF.md`) |
 | Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | The remaining measured pixel differences (equalizer curve, paused peak mark, playlist thumb) |
 | Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | |
 | Media library database, tag editing | |
@@ -227,3 +228,4 @@ Winamp plugin SDK's own terms are read in
 [LICENSE](LICENSE), the permissive texts in
 [LICENSE-MIT](LICENSE-MIT)/[LICENSE-APACHE](LICENSE-APACHE). Third-party code
 and its licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
