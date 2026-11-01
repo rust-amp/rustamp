@@ -89,7 +89,14 @@ impl Base {
         // `is_absolute` is false for a Windows drive path on Unix, so drive
         // paths are checked explicitly: a playlist written on Windows must
         // resolve to the same location on every platform.
-        if path.is_absolute() || is_drive(&normalized) {
+        // On Unix `/root.mp3` is an absolute path, but against a URL base it is
+        // root-relative to that URL, as it is on Windows (where it is not
+        // absolute). A UNC-looking `//host/share` stays a file everywhere.
+        let url_root_relative = cfg!(unix)
+            && matches!(self, Base::Url(_))
+            && raw.starts_with('/')
+            && !raw.starts_with("//");
+        if !url_root_relative && (path.is_absolute() || is_drive(&normalized)) {
             return Some(MediaLocation::File(path.to_path_buf()));
         }
         match self {

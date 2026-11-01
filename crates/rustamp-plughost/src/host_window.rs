@@ -209,6 +209,14 @@ impl HostWindow {
 
     /// Sends the plug-ins an event, the way a player does: to its own main window,
     /// where a plug-in that wants it has subclassed the procedure.
+    #[cfg(not(windows))]
+    pub fn notify_plugins(&self, _parameter: usize, _ipc_id: u32) {
+        // No plug-in can have subclassed a window that is not a Windows window.
+    }
+
+    /// Sends the plug-ins an event, the way a player does: to its own main window,
+    /// where a plug-in that wants it has subclassed the procedure.
+    #[cfg(windows)]
     pub fn notify_plugins(&self, parameter: usize, ipc_id: u32) {
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_USER};
@@ -225,6 +233,11 @@ impl HostWindow {
     }
 
     /// Sets the window's title, the track as `WM_GETTEXT` reads it.
+    #[cfg(not(windows))]
+    pub fn set_title(&self, _title: &str) {}
+
+    /// Sets the window's title, the track as `WM_GETTEXT` reads it.
+    #[cfg(windows)]
     pub fn set_title(&self, title: &str) {
         use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
         use windows::core::PCWSTR;

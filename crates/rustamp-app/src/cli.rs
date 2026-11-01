@@ -723,7 +723,20 @@ fn unquote(path: &str) -> &str {
 /// a token that would be refused as an option is never taken as a path.
 /// Anything else is a path.
 fn is_switch(arg: &str) -> bool {
-    arg.starts_with('/') || (arg.starts_with('-') && arg.len() > 1)
+    (arg.starts_with('/') && !is_unix_absolute_path(arg)) || (arg.starts_with('-') && arg.len() > 1)
+}
+
+/// Whether a `/`-led argument is an absolute Unix path rather than a reference
+/// switch. Every Unix absolute path starts with `/`, so on Unix the switch
+/// name (the text up to a `=` or a space) must not itself contain a `/`:
+/// `/ADD` and `/CONFIG=/etc/x` are switches, `/home/me/a.mp3` is a path. On
+/// Windows a leading `/` is always a switch.
+fn is_unix_absolute_path(arg: &str) -> bool {
+    cfg!(unix)
+        && arg
+            .strip_prefix('/')
+            .and_then(|rest| rest.split(['=', ' ']).next())
+            .is_some_and(|name| name.contains('/'))
 }
 
 /// Records the media argument; a second one is refused.

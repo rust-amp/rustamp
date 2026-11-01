@@ -373,18 +373,30 @@ pub fn apply_plugin_request(
         ControlInbound::ConfigurePlugin { plugin_id, kind } => registry
             .configure_plugin(*plugin_id, *kind)
             .map_err(|error| format!("cannot configure plugin {plugin_id} (as {kind:?}): {error}")),
+        #[cfg(any(windows, test))]
         ControlInbound::SeekPlugin { plugin_id, to_ms } => registry
             .seek_input(*plugin_id, *to_ms)
             .map_err(|error| format!("cannot seek plugin {plugin_id} to {to_ms} ms: {error}")),
+        #[cfg(any(windows, test))]
         ControlInbound::PausePlugin { plugin_id } => registry
             .pause_input(*plugin_id)
             .map_err(|error| format!("cannot pause plugin {plugin_id}: {error}")),
+        #[cfg(any(windows, test))]
         ControlInbound::UnpausePlugin { plugin_id } => registry
             .unpause_input(*plugin_id)
             .map_err(|error| format!("cannot resume plugin {plugin_id}: {error}")),
+        #[cfg(any(windows, test))]
         ControlInbound::StopPlugin { plugin_id } => registry
             .stop_input(*plugin_id)
             .map_err(|error| format!("cannot stop plugin {plugin_id}: {error}")),
+        // Input plug-ins are Windows binaries: off Windows there is nothing to drive.
+        #[cfg(not(any(windows, test)))]
+        ControlInbound::SeekPlugin { .. }
+        | ControlInbound::PausePlugin { .. }
+        | ControlInbound::UnpausePlugin { .. }
+        | ControlInbound::StopPlugin { .. } => {
+            Err("input plug-ins are not supported on this platform".to_string())
+        }
         // Not plug-in requests of this function: the UI loop acts on them itself
         // (it needs the registry mutably, or it keeps the frame).
         ControlInbound::State(_)

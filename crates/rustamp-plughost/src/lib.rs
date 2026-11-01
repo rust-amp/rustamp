@@ -37,7 +37,6 @@ pub mod fault;
 pub mod handoff;
 pub mod host_services;
 pub mod host_window;
-#[cfg(any(windows, test))]
 pub mod input;
 pub mod input_resident;
 pub mod ipc;

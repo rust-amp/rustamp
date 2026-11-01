@@ -1361,6 +1361,7 @@ fn tiny_module() -> Vec<u8> {
 /// built-in decoder gives the same file.
 #[test]
 #[ignore = "VM-only: runs real input plug-ins and needs the VB-Audio Virtual Cable"]
+#[cfg(windows)]
 fn the_cable_carries_what_the_winamp5_input_plugins_decode() {
     use rustamp_app::dsp::DspChain;
     use rustamp_app::plugin_input::factory;
@@ -1428,6 +1429,7 @@ fn the_cable_carries_what_the_winamp5_input_plugins_decode() {
 /// `in_openmpt` plays a format the player has no decoder for.
 #[test]
 #[ignore = "VM-only: runs a real input plug-in and needs the VB-Audio Virtual Cable"]
+#[cfg(windows)]
 fn the_cable_carries_a_module_through_in_openmpt() {
     use rustamp_app::dsp::DspChain;
     use rustamp_app::plugin_input::factory;
@@ -1500,6 +1502,7 @@ fn the_cable_carries_a_tone_through_dsp_sps() {
 /// default device, which in the VM is the cable; `out_disk` writes a file.
 #[test]
 #[ignore = "VM-only: runs real output plug-ins and needs the VB-Audio Virtual Cable"]
+#[cfg(windows)]
 fn the_output_plugins_play_what_the_engine_renders() {
     use rustamp_app::dsp::DspChain;
     use rustamp_app::plugin_output::PluginOutput;
@@ -1573,6 +1576,7 @@ fn the_output_plugins_play_what_the_engine_renders() {
 /// time like every output (see `rustamp_app::plugin_output`).
 #[test]
 #[ignore = "VM-only: runs a real output plug-in"]
+#[cfg(windows)]
 fn out_disk_writes_what_the_engine_renders() {
     use rustamp_app::plugin_output::PluginOutput;
 
@@ -1713,6 +1717,7 @@ fn pump_engine(engine: &mut Engine, seconds: f64, until_stop: bool) {
 /// finalized files, each named after its own title.
 #[test]
 #[ignore = "VM-only: runs a real output plug-in"]
+#[cfg(windows)]
 fn out_disk_names_a_file_per_track_and_finalizes_it() {
     use rustamp_app::dsp::NowPlaying;
     use rustamp_app::plugin_output::PluginOutput;
@@ -1821,6 +1826,7 @@ fn out_disk_names_a_file_per_track_and_finalizes_it() {
 /// between two stretches of the tone.
 #[test]
 #[ignore = "VM-only: runs a real output plug-in and needs the VB-Audio Virtual Cable"]
+#[cfg(windows)]
 fn a_pause_reaches_out_wave() {
     use rustamp_app::dsp::NowPlaying;
     use rustamp_app::plugin_output::PluginOutput;

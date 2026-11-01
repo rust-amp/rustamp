@@ -1859,6 +1859,15 @@ fn walk_files(state: &mut ScanState<'_>, dir: &Path) -> Result<bool> {
             return Ok(true);
         }
     };
+    // NTFS lists a directory in name order; other file systems list it in
+    // whatever order they keep it. A scan must give the same rows (and the
+    // same row ids) for the same tree, so off Windows the entries are sorted.
+    #[cfg(not(windows))]
+    let entries = {
+        let mut listed: Vec<_> = entries.collect();
+        listed.sort_by_key(|entry| entry.as_ref().ok().map(|entry| entry.file_name()));
+        listed
+    };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,

@@ -88,7 +88,10 @@ fn a_value_that_names_the_directory_above_the_target_is_refused() {
     );
     assert_eq!(
         plan.errors[0].to_string(),
-        "Error extracting track #1: the path is not one path inside the target directory: ..\\Dancing Queen"
+        format!(
+            "Error extracting track #1: the path is not one path inside the target directory: ..{}Dancing Queen",
+            std::path::MAIN_SEPARATOR
+        )
     );
 }
 

@@ -108,8 +108,26 @@ pub const MAX_INSTANCES: u32 = 8;
 ///
 /// The name is in the local pipe namespace and carries the instance key, so
 /// only this logon session can reach it and two instances never collide.
+#[cfg(windows)]
 pub fn pipe_name(key: &str) -> String {
     format!(r"\\.\pipe\rustamp-ctl-{key}")
+}
+
+/// The socket an instance key is served on (off Windows the channel is a Unix
+/// domain socket, the counterpart of the Windows named pipe).
+///
+/// It lives in the user's runtime directory when there is one, so only this
+/// user can reach it, and carries the instance key, so two instances never
+/// collide.
+#[cfg(not(windows))]
+pub fn pipe_name(key: &str) -> String {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("rustamp-ctl-{key}.sock"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Refuses the channel when the run's own window rail refuses it.
@@ -461,7 +479,7 @@ impl LineBuffer {
 ///
 /// The connection's own event subscription lives as long as the connection, so
 /// a `wait` sees every event published after the client connected.
-fn serve(mut file: std::fs::File, handles: Handles) {
+fn serve(mut file: impl std::io::Read + std::io::Write, handles: Handles) {
     let events = handles.bus.subscribe();
     let mut lines = LineBuffer::default();
     // The loop ends at the end of the stream, on a line this build refuses,
@@ -701,23 +719,84 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    //! Non-Windows stub: the control channel is a Win32 named pipe for now.
+    //! Unix listener: one Unix domain socket, one thread per connection.
 
-    use super::Handles;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
-    /// A listener that is never started.
+    use super::{Handles, serve};
+
+    /// How often the listener looks at its stop flag while nobody connects.
+    const POLL: Duration = Duration::from_millis(20);
+
+    /// The listener and the state a drop needs to stop it.
     #[derive(Debug)]
     pub struct Server {
-        _priv: (),
+        /// The socket file, removed again when the server stops.
+        path: PathBuf,
+        /// Set to ask the listener thread to stop.
+        stop: Arc<AtomicBool>,
+        /// The listener thread.
+        thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Server {
-        /// Off Windows there is no named pipe: the channel refuses to start.
-        pub fn start(pipe: &str, _handles: Handles) -> std::io::Result<Self> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!("{pipe} needs a Win32 named pipe, which this build does not have"),
-            ))
+        /// Binds the socket and starts the listener.
+        pub fn start(pipe: &str, handles: Handles) -> std::io::Result<Self> {
+            let path = PathBuf::from(pipe);
+            // A socket file left by a run that did not exit cleanly would make
+            // `bind` fail. A live listener behind it is the other instance of
+            // the same key, which the single-instance guard already refuses.
+            if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
+                let _ = std::fs::remove_file(&path);
+            }
+            let listener = UnixListener::bind(&path)?;
+            // Owner only: the channel can drive the player.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let thread = std::thread::Builder::new()
+                .name("rustamp-control".to_owned())
+                .spawn(move || {
+                    while !flag.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                // The accepted stream must block: `serve` reads lines.
+                                if stream.set_nonblocking(false).is_err() {
+                                    continue;
+                                }
+                                let handles = handles.clone();
+                                let _ = std::thread::Builder::new()
+                                    .name("rustamp-control-conn".to_owned())
+                                    .spawn(move || serve(stream, handles));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(POLL);
+                            }
+                            Err(_) => std::thread::sleep(POLL),
+                        }
+                    }
+                })?;
+            Ok(Server {
+                path,
+                stop,
+                thread: Some(thread),
+            })
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -975,10 +1054,13 @@ mod tests {
 
     #[test]
     fn every_pipe_name_is_the_control_channel_of_its_key() {
+        #[cfg(windows)]
         assert_eq!(
             pipe_name("0123456789abcdef"),
             r"\\.\pipe\rustamp-ctl-0123456789abcdef"
         );
+        #[cfg(not(windows))]
+        assert!(pipe_name("0123456789abcdef").ends_with("rustamp-ctl-0123456789abcdef.sock"));
         assert_ne!(pipe_name("a"), pipe_name("b"));
     }
 }

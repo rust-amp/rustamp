@@ -15,6 +15,8 @@
 //! files are staged by the VM runner under `%RUSTAMP_TESTPLUGINS%` (`w566` and
 //! `milkdrop2-data`); nothing of them is in the repository.
 
+#![cfg(windows)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

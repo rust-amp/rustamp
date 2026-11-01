@@ -135,13 +135,14 @@ pub fn now_ms() -> u128 {
 /// answer says so.
 pub fn powershell(script: &str, seconds: u64) -> String {
     use std::io::Read;
-    use std::os::windows::process::CommandExt;
-    let spawned = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(0x0800_0000)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let spawned = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => return format!("powershell failed: {error}"),

@@ -125,6 +125,7 @@ unsafe extern "system" {
 }
 
 /// Why the UI loop exited.
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiLoopExit {
     /// The reader thread finished (shutdown requested, closed, or error).
@@ -368,6 +369,7 @@ fn apply_state(window: &HostWindow, registry: &mut PluginRegistry, state: &Playe
     });
 }
 
+#[cfg(windows)]
 fn run_ui_loop(
     window: &HostWindow,
     registry: &mut PluginRegistry,

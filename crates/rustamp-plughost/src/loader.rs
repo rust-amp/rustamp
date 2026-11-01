@@ -1350,6 +1350,7 @@ impl LoadedPlugin {
             let _scope = plugin_call_scope(&self.identity, "init");
             unsafe { crate::vis::init_vis_module(module, host_hwnd, hinstance) }?
         };
+        #[cfg(any(windows, test))]
         if let LoadedPluginInner::Vis {
             active,
             init_called,
@@ -1436,6 +1437,7 @@ impl LoadedPlugin {
         if init.init_result != 0 {
             return Err(DspError::InitFailed(init.init_result));
         }
+        #[cfg(any(windows, test))]
         if let LoadedPluginInner::Dsp {
             active,
             init_called,

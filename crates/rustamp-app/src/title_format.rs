@@ -366,7 +366,7 @@ mod tests {
             comment: Some("A comment".to_string()),
             ..TrackMetadata::default()
         };
-        let source = TrackSource::path("C:\\Music\\the-title.mp3");
+        let source = TrackSource::path(std::path::Path::new("Music").join("the-title.mp3"));
         let fields = row_fields(&source, Some(&metadata));
         assert_eq!(fields.get("filename"), Some("the-title.mp3"));
         assert_eq!(fields.get("title"), Some("The Title"));
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_row_without_tags_carries_only_its_name() {
-        let source = TrackSource::path("C:\\Music\\the-title.mp3");
+        let source = TrackSource::path(std::path::Path::new("Music").join("the-title.mp3"));
         let fields = row_fields(&source, None);
         assert_eq!(fields.get("filename"), Some("the-title.mp3"));
         assert_eq!(fields.get("title"), None);

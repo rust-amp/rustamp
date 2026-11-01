@@ -125,20 +125,27 @@ mod tests {
 
     #[test]
     fn the_folder_follows_what_the_host_answers() {
-        let classic = Path::new(r"C:\player\plugins\vis_milk2.dll");
-        let other = Path::new(r"C:\elsewhere\vis_milk2.dll");
-        let appdata = Path::new(r"C:\appdata");
+        // Paths of the platform the test runs on: a `C:\` path has no parent on Unix.
+        let root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let classic_folder = root.join("player").join("plugins");
+        let classic = classic_folder.join("vis_milk2.dll");
+        let classic = classic.as_path();
+        let other = root.join("elsewhere").join("vis_milk2.dll");
+        let other = other.as_path();
+        let appdata = root.join("appdata");
+        let appdata = appdata.as_path();
+        let s = root.join("s");
         assert_eq!(
             plugins_folder(classic, None, Some(appdata)),
-            Some(PathBuf::from(r"C:\player\plugins"))
+            Some(classic_folder)
         );
         assert_eq!(
             plugins_folder(other, None, Some(appdata)),
             Some(appdata.join("Rustamp").join("plugins"))
         );
         assert_eq!(
-            plugins_folder(classic, Some(Path::new(r"C:\s")), Some(appdata)),
-            Some(Path::new(r"C:\s").join("plugins"))
+            plugins_folder(classic, Some(s.as_path()), Some(appdata)),
+            Some(s.join("plugins"))
         );
     }
 }

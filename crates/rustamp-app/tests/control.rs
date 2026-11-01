@@ -402,7 +402,13 @@ fn every_spawn_site_is_guarded() {
 #[test]
 fn the_name_reaches_the_pipe() {
     let pipe = rustamp_app::control::pipe_name("abc");
+    #[cfg(windows)]
     assert_eq!(pipe, r"\\.\pipe\rustamp-ctl-abc");
+    #[cfg(not(windows))]
+    assert!(
+        pipe.ends_with("rustamp-ctl-abc.sock"),
+        "the channel is a socket named after the key: {pipe}"
+    );
     assert!(
         Path::new(&pipe).is_absolute() || pipe.starts_with(r"\\.\pipe\"),
         "the channel is in the local pipe namespace: {pipe}"
