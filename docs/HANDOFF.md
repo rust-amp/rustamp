@@ -70,6 +70,28 @@ Status as of **2026-10-15**, after the second session (OpenCode orchestrator): l
 > `handed - slack` never lifts the clock to the end.
 
 **Rustamp** is a new media player that looks, feels and behaves like **Winamp 2.95** on Windows, built in **Rust** on modern technology.
+>
+> **The three failing cable cases, instrumented (2026-11-01, second run):** they
+> are **three defects**, not one, and the panics now print the numbers
+> (`played`, `end_of_stream`, `position`):
+>
+> 1. `out_disk_writes_what_the_engine_renders`: `played 0, end None, device
+>    None`. The tone never starts - the pump is stuck in the plug-in's write
+>    path, so no block is ever handed over (clock 0). Look at out_disk's
+>    `can_write`/`write` handshake in the resident, not at the engine.
+> 2. `a_pause_reaches_out_wave`: `played 56580, end None, position 56580`. A
+>    pause flushes the output, `flush_output` revokes the end
+>    (`DecodeOut::EndOfStreamRevoked`), and a decoder that already reached its
+>    end never reports `EndOfStream` again - so `end_of_stream` stays `None` and
+>    the natural-end block never runs.
+> 3. `the_output_plugins_play_what_the_engine_renders`: `played 44254` for a
+>    one-second tone, 4 of 9 windows hold it. The device clock counts two
+>    seconds of handed-over audio, so it is not a play position; the drain added
+>    in `a067473` waits for a clock that is already past the end.
+>
+> The bounded drain of `a067473` stays (it is right in principle) but fixes
+> none of the three on its own. Everything else on the cable passes: 9 of 12.
+> Nothing is pushed or tagged; the release waits for these three.
 
 - **Windows first.** Linux and macOS come later (milestone M6). Classic plugins will run there under Wine.
 - **The player is 64-bit only** (`rustamp.exe`, x86_64). Only the separate **plugin host `rustamp-plughost32.exe` is 32-bit** (i686), so it can load classic 32-bit Winamp 2.x plugins: `in_`, `out_`, `vis_`, `dsp_` and `gen_`. MilkDrop 2, AVS and Geiss have priority.
