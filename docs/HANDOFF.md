@@ -98,6 +98,20 @@ Status as of **2026-10-15**, after the second session (OpenCode orchestrator): l
 >   names its file after it; the track is published, but the `NowPlaying` message
 >   travels with the first block, i.e. after the resident has opened the output.
 > - `out_wave` hands over ~1.2 s of a 6 s tone and then blocks: the resident
+>
+> **After two product fixes (2026-11-01, late):** `a9f1b25` makes the resident
+> write what the plug-in says it takes (`can_write`) instead of demanding a
+> fixed 8192 bytes, and `7b73475` lets the natural end wait for the device's
+> `drain_time`. The cable group then measured **10 of 12** in one run -
+> `the_output_plugins_play_what_the_engine_renders` passed with the whole tone -
+> and **9 of 12** in the next run on the same tree, with that case red again.
+> The remaining failures are not stable enough to chase with another parameter:
+> what is needed is a trace inside the helper of `can_write` over time (does it
+> free?), of whether `Message::NowPlaying` reaches `OutputChain::note` before
+> `open` (out_disk still reads IPC 212 as 0x0 and takes no block, then
+> "resident DSP read timed out"), and of when `PausePlugin` lands in the plug-in
+> (the two-second pause shows up as one or two windows of silence instead of
+> twenty).
 >   stops returning blocks while the plug-in's buffer is still being consumed.
 >   That is why the pause case never reaches its end (the ring never drains) and
 >   why the one-second tone loses its tail.
