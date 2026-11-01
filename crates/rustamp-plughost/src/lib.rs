@@ -43,6 +43,7 @@ pub mod input_resident;
 pub mod ipc;
 pub mod loader;
 pub mod message_loop;
+pub mod module_path;
 #[cfg(any(windows, test))]
 pub mod os_version;
 pub mod pe_preflight;

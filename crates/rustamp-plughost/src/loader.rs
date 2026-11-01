@@ -1896,6 +1896,12 @@ unsafe fn load_plugin_x86(
     }
     // SAFETY: load_plugin checked approval; caller trusts code/dependencies.
     let hinstance = unsafe { map_plugin_image(&image)? };
+    // The image is mapped by the host, not by the loader, so the system cannot
+    // name its path. A plug-in that derives its own folder (Cockos Happy AVS
+    // reads `<its folder>\vis_avs.dat`) gets the answer from the host instead.
+    // SAFETY: the image is mapped in this process and the plug-in's `init` has
+    // not run yet.
+    let _ = unsafe { crate::module_path::answer_own_path(hinstance, &image.path) };
 
     // Preflight chose the export without executing DllMain or a getter. Actual
     // address resolution is still checked; a trusted DllMain can alter memory.

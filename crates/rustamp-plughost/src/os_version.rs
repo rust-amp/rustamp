@@ -108,15 +108,20 @@ unsafe extern "system" fn old_get_version_ex(block: *mut u8) -> i32 {
     1
 }
 
-/// Points the mapped library's `GetVersionExA` at the old answer; whether it
-/// imports the function, and so whether asking again can change anything.
+/// Points one import slot of a mapped image at `replacement`; whether the image
+/// imports that function at all.
 ///
 /// # Safety
 ///
-/// `module` is the base of a library mapped in this process, on the thread that
-/// loads it, before any of its threads runs.
+/// `module` is the base of a library mapped in this process, and `replacement`
+/// has the imported function's own calling convention and signature.
 #[cfg(windows)]
-pub unsafe fn report_old_system(module: *mut core::ffi::c_void) -> bool {
+pub(crate) unsafe fn point_import(
+    module: *mut core::ffi::c_void,
+    library: &str,
+    function: &str,
+    replacement: usize,
+) -> bool {
     unsafe extern "system" {
         fn VirtualProtect(address: *mut u8, size: usize, new: u32, old: *mut u32) -> i32;
     }
@@ -129,11 +134,10 @@ pub unsafe fn report_old_system(module: *mut core::ffi::c_void) -> bool {
         let size = base.add(headers + 24 + 56).cast::<u32>().read_unaligned() as usize;
         std::slice::from_raw_parts(base, size)
     };
-    let Some(slot) = import_slot(image, "KERNEL32.dll", "GetVersionExA") else {
+    let Some(slot) = import_slot(image, library, function) else {
         return false;
     };
     let width = std::mem::size_of::<usize>();
-    let replacement = old_get_version_ex as unsafe extern "system" fn(*mut u8) -> i32 as usize;
     // SAFETY: the slot lies in the mapped image, found through its own tables;
     // its page is made writable for the one write and restored afterwards.
     unsafe {
@@ -145,8 +149,25 @@ pub unsafe fn report_old_system(module: *mut core::ffi::c_void) -> bool {
         target.cast::<usize>().write_unaligned(replacement);
         VirtualProtect(target, width, previous, &mut previous);
     }
-    crate::fault::trace_event("the plug-in refused to load: it now hears Windows XP");
     true
+}
+
+/// Points the mapped library's `GetVersionExA` at the old answer; whether it
+/// imports the function, and so whether asking again can change anything.
+///
+/// # Safety
+///
+/// `module` is the base of a library mapped in this process, on the thread that
+/// loads it, before any of its threads runs.
+#[cfg(windows)]
+pub unsafe fn report_old_system(module: *mut core::ffi::c_void) -> bool {
+    let replacement = old_get_version_ex as unsafe extern "system" fn(*mut u8) -> i32 as usize;
+    // SAFETY: the caller's own contract above.
+    let taken = unsafe { point_import(module, "KERNEL32.dll", "GetVersionExA", replacement) };
+    if taken {
+        crate::fault::trace_event("the plug-in refused to load: it now hears Windows XP");
+    }
+    taken
 }
 
 #[cfg(test)]
