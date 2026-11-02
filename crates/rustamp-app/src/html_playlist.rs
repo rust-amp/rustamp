@@ -443,8 +443,10 @@ mod tests {
     fn a_failed_write_is_reported() {
         let mut app = test_app();
         add_entries(&mut app, &["C:\\Music\\one.mp3"]);
-        let missing = std::path::Path::new("Z:\\no-such-directory\\playlist.html");
-        assert!(app.finish_html_playlist(Some(missing)).is_err());
+        let missing = std::env::temp_dir()
+            .join("rustamp-no-such-directory")
+            .join("playlist.html");
+        assert!(app.finish_html_playlist(Some(&missing)).is_err());
         let notes = app.drain_notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(

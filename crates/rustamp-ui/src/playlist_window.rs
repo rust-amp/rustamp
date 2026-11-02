@@ -1247,7 +1247,9 @@ mod tests {
     }
 
     /// The runtime size replaces the **size** only: the family and the style
-    /// stay the skin's (S17 §5).
+    /// stay the skin's (S17 §5). Windows only: the test needs both families,
+    /// and other systems may answer both with one fallback.
+    #[cfg(windows)]
     #[test]
     fn the_runtime_size_keeps_the_skins_family_and_style() {
         use rustamp_core::playlist::EntryId;

@@ -212,7 +212,7 @@ mod tests {
             }
         });
         let id = EntryId(7);
-        reader.request(id, Path::new("C:\\Music\\song.mp3"));
+        reader.request(id, &Path::new("Music").join("song.mp3"));
         // The worker reads the file on its own thread: the app waits for the
         // result, but only for as long as a read takes.
         let mut waited = 0;

@@ -4070,7 +4070,16 @@ impl App {
             .filter(|(_, kind)| *kind == PluginKind::Input)
             .map(|(path, _)| path)
             .collect();
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut registry = self.builtin_registry.clone();
+        #[cfg(not(windows))]
+        if !inputs.is_empty() {
+            self.note(
+                "input plug-ins cannot play: plug-ins are not supported on this platform yet"
+                    .to_owned(),
+            );
+        }
+        #[cfg(windows)]
         if !inputs.is_empty() {
             match crate::supervise::find_plugin_host() {
                 Some(helper) => {
@@ -6362,6 +6371,14 @@ mod tests {
         );
     }
 
+    /// The path `approved_entry` gives `file`, as the host is asked for it.
+    fn plugin_file(file: &str) -> String {
+        PathBuf::from("C:\\plugins")
+            .join(file)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// One approved plug-in, as the scan would list it.
     fn approved_entry(file: &str, kind: PluginKind) -> rustamp_prefs::PluginEntry {
         rustamp_prefs::PluginEntry {
@@ -6460,7 +6477,7 @@ mod tests {
         // (the greeting, the state snapshot) are not requests.
         assert_eq!(
             load_requests(&mut host_end),
-            vec![("C:\\plugins\\gen_one.dll".to_string(), PluginKind::General)]
+            vec![(plugin_file("gen_one.dll"), PluginKind::General)]
         );
         // The choice is saved as well: the plug-in stays on after a restart.
         assert_eq!(app.config.plugins.enabled, ["gen_one.dll"]);
@@ -6717,8 +6734,8 @@ mod tests {
         assert_eq!(
             load_requests(&mut host_end),
             vec![
-                ("C:\\plugins\\gen_one.dll".to_string(), PluginKind::General),
-                ("C:\\plugins\\in_two.dll".to_string(), PluginKind::Input),
+                (plugin_file("gen_one.dll"), PluginKind::General),
+                (plugin_file("in_two.dll"), PluginKind::Input),
             ]
         );
     }
@@ -6744,7 +6761,7 @@ mod tests {
 
         assert_eq!(
             load_requests(&mut host_end),
-            vec![("C:\\plugins\\gen_one.dll".to_string(), PluginKind::General)]
+            vec![(plugin_file("gen_one.dll"), PluginKind::General)]
         );
     }
 
@@ -7425,7 +7442,11 @@ mod tests {
     #[test]
     fn the_marquee_says_what_failed_by_the_file_name() {
         assert_eq!(
-            status_text(r"error: cannot play C:\Music\dead.mp3: unsupported format").as_deref(),
+            status_text(&format!(
+                "error: cannot play {}: unsupported format",
+                std::path::Path::new("Music").join("dead.mp3").display()
+            ))
+            .as_deref(),
             Some("cannot play dead.mp3: unsupported format")
         );
         assert_eq!(

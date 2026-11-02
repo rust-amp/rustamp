@@ -89,7 +89,14 @@ impl Base {
         // `is_absolute` is false for a Windows drive path on Unix, so drive
         // paths are checked explicitly: a playlist written on Windows must
         // resolve to the same location on every platform.
-        if path.is_absolute() || is_drive(&normalized) {
+        // On Unix `/root.mp3` is an absolute path, but against a URL base it is
+        // root-relative to that URL, as it is on Windows (where it is not
+        // absolute). A UNC-looking `//host/share` stays a file everywhere.
+        let url_root_relative = cfg!(unix)
+            && matches!(self, Base::Url(_))
+            && normalized.starts_with('/')
+            && !normalized.starts_with("//");
+        if !url_root_relative && (path.is_absolute() || is_drive(&normalized)) {
             return Some(MediaLocation::File(path.to_path_buf()));
         }
         match self {
@@ -316,6 +323,19 @@ fn join_url(base: &str, rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two separators mean the same here, as they do on Windows.
+    #[test]
+    fn a_root_relative_entry_against_a_url_stays_a_url_with_either_separator() {
+        let base = Base::Url("http://example.com/lists/a.m3u".to_owned());
+        for raw in ["/x.mp3", "\\x.mp3"] {
+            assert!(
+                matches!(base.resolve(raw), Some(MediaLocation::Url(_))),
+                "{raw}: {:?}",
+                base.resolve(raw)
+            );
+        }
+    }
 
     fn file(p: &str) -> MediaLocation {
         MediaLocation::File(PathBuf::from(p))

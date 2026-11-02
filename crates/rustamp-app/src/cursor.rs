@@ -238,6 +238,7 @@ mod tests {
         assert_eq!(cursors.cached_slots(), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_built_in_skins_cursors_become_operating_system_cursors() {
         // The operating system's own loader takes the built-in skin's

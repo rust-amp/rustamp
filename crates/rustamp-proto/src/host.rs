@@ -82,9 +82,13 @@ mod tests {
 
     #[test]
     fn media_location_wire_from_file() {
-        let loc = MediaLocation::File(std::path::PathBuf::from("C:\\Music\\track.mp3"));
+        // A path of the platform the test runs on: `C:\\Music` is not one on Unix.
+        let path = std::path::Path::new(if cfg!(windows) { "C:\\Music" } else { "/Music" })
+            .join("track.mp3");
+        let text = path.to_string_lossy().into_owned();
+        let loc = MediaLocation::File(path);
         let wire = MediaLocationWire::from_media_location(&loc);
-        assert_eq!(wire, MediaLocationWire::File("C:\\Music\\track.mp3".into()));
+        assert_eq!(wire, MediaLocationWire::File(text));
         assert_eq!(wire.file_name(), "track.mp3");
     }
 

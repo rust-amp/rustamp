@@ -723,7 +723,24 @@ fn unquote(path: &str) -> &str {
 /// a token that would be refused as an option is never taken as a path.
 /// Anything else is a path.
 fn is_switch(arg: &str) -> bool {
-    arg.starts_with('/') || (arg.starts_with('-') && arg.len() > 1)
+    (arg.starts_with('/') && !is_unix_absolute_path(arg)) || (arg.starts_with('-') && arg.len() > 1)
+}
+
+/// Whether a `/`-led argument is an absolute Unix path rather than a reference
+/// switch. Every Unix absolute path starts with `/`, so on Unix only the forms
+/// the parser reads as switches are switches: `/ADD` and `/CONFIG=/etc/x` are,
+/// `/song.mp3` and `/my music/a.mp3` are paths. On Windows a leading `/` is
+/// always a switch.
+fn is_unix_absolute_path(arg: &str) -> bool {
+    cfg!(unix)
+        && arg.strip_prefix('/').is_some_and(|rest| {
+            !matches!(
+                rest,
+                "INSTALL" | "UNREG" | "NOREG" | "ONLYINSTALL" | "BOOKMARK" | "ADD"
+            ) && !["CLASS=", "CONFIG=", "BOOKMARK ", "ADD "]
+                .iter()
+                .any(|prefix| rest.starts_with(prefix))
+        })
 }
 
 /// Records the media argument; a second one is refused.
@@ -1108,6 +1125,23 @@ mod tests {
         // S13 §5.3 leaves the form open; the parser does not guess.
         let args = parse_args(&["/BOOKMARK"]).unwrap();
         assert_eq!(args.bookmark, Some(Bookmark::WithoutPath));
+    }
+
+    /// A path right under the root, or with a space in its first directory, is
+    /// a path, and only what the parser reads as a switch is a switch.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_unix_path_follows_a_switch() {
+        for path in ["/song.mp3", "/my music/a.mp3", "/home/me/a.mp3"] {
+            let args = parse_args(&["/ADD", path]).unwrap();
+            assert_eq!(
+                args.enqueue,
+                Enqueue::Location(MediaLocation::File(PathBuf::from(path))),
+                "{path}"
+            );
+        }
+        let args = parse_args(&["/ADD", "/CONFIG=/etc/rustamp.toml"]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::WithoutPath);
     }
 
     #[test]

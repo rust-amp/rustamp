@@ -277,12 +277,45 @@ fn known_family(database: &fontdb::Database, family: &str) -> Option<String> {
         .next()
 }
 
+/// `fontdb` answers the generic sans-serif with "Arial", which Linux does not
+/// ship: with no Arial, the playlist's own family and its generic fallback both
+/// miss and no text is drawn at all. Off Windows the generic is pointed at the
+/// first family of this list the host has (macOS carries Helvetica Neue and
+/// Arial; the Linux desktops carry one of the others).
+#[cfg(not(windows))]
+fn point_generic_sans_at_an_installed_family(database: &mut fontdb::Database) {
+    const CANDIDATES: &[&str] = &[
+        "Arial",
+        "Helvetica Neue",
+        "Helvetica",
+        "Liberation Sans",
+        "Noto Sans",
+        "DejaVu Sans",
+        "Cantarell",
+        "Ubuntu",
+        "FreeSans",
+        "Inter",
+    ];
+    let installed = |wanted: &str| {
+        database.faces().any(|face| {
+            face.families
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(wanted))
+        })
+    };
+    if let Some(found) = CANDIDATES.iter().copied().find(|name| installed(name)) {
+        database.set_sans_serif_family(found);
+    }
+}
+
 /// The fonts of the host, read once.
 fn fonts() -> &'static Mutex<Fonts> {
     static FONTS: OnceLock<Mutex<Fonts>> = OnceLock::new();
     FONTS.get_or_init(|| {
         let mut database = fontdb::Database::new();
         database.load_system_fonts();
+        #[cfg(not(windows))]
+        point_generic_sans_at_an_installed_family(&mut database);
         Mutex::new(Fonts {
             database,
             loaded: HashMap::new(),

@@ -165,11 +165,17 @@ fn a_temp_library_with_two_rows_writes_the_expected_file_names() {
     let playlist = target.join(PLAYLIST_NAME);
     let text = std::fs::read_to_string(&playlist).expect("the playlist");
     assert!(
-        text.contains(r"Abba Gold - Greatest Hits\07 - Dancing Queen.mp3"),
+        text.contains(&format!(
+            "Abba Gold - Greatest Hits{}07 - Dancing Queen.mp3",
+            std::path::MAIN_SEPARATOR
+        )),
         "{text}"
     );
     assert!(
-        text.contains(r"Abba Gold - Greatest Hits\08 - Money Money Money.mp3"),
+        text.contains(&format!(
+            "Abba Gold - Greatest Hits{}08 - Money Money Money.mp3",
+            std::path::MAIN_SEPARATOR
+        )),
         "{text}"
     );
 

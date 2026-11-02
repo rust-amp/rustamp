@@ -786,6 +786,8 @@ mod tests {
         assert!(client_peer.check().is_err());
     }
 
+    // `NamedPcmRings` exists on Windows only.
+    #[cfg(windows)]
     #[test]
     fn decoder_session_open_fails_sticky_as_disconnected_when_server_reports_decoder_error() {
         let (client_r, server_w) = pipe();

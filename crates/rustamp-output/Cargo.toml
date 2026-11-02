@@ -11,5 +11,7 @@ rust-version.workspace = true
 [dependencies]
 rustamp-core.workspace = true
 cpal.workspace = true
-wasapi.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+wasapi.workspace = true

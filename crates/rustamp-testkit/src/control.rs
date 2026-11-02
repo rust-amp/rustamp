@@ -20,8 +20,11 @@
 //! (MIT OR Apache-2.0); this implementation is ours (named pipe, typed serde,
 //! request ids) and no source text of that project was copied.
 
+#[cfg(windows)]
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use rustamp_proto::command::Command;
@@ -158,7 +161,11 @@ impl Response {
 #[derive(Debug)]
 pub struct ControlClient {
     /// The duplex pipe connection.
+    #[cfg(windows)]
     file: File,
+    /// The duplex socket connection.
+    #[cfg(unix)]
+    file: UnixStream,
     /// The id the next request gets.
     next_id: u64,
 }
@@ -177,7 +184,11 @@ impl ControlClient {
     pub fn connect_within(pipe: &str, timeout: Duration) -> std::io::Result<Self> {
         let deadline = Instant::now() + timeout;
         loop {
-            match OpenOptions::new().read(true).write(true).open(pipe) {
+            #[cfg(windows)]
+            let opened = OpenOptions::new().read(true).write(true).open(pipe);
+            #[cfg(unix)]
+            let opened = UnixStream::connect(pipe);
+            match opened {
                 Ok(file) => {
                     return Ok(ControlClient { file, next_id: 1 });
                 }

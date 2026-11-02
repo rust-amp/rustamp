@@ -682,8 +682,8 @@ mod tests {
         assert_eq!(
             parse_selection(&buffer(&["C:\\Music", "a.mp3", "b with spaces.mp3"])),
             vec![
-                PathBuf::from("C:\\Music\\a.mp3"),
-                PathBuf::from("C:\\Music\\b with spaces.mp3"),
+                PathBuf::from("C:\\Music").join("a.mp3"),
+                PathBuf::from("C:\\Music").join("b with spaces.mp3"),
             ]
         );
     }
