@@ -63,7 +63,8 @@
 //! `--control[=<name>]` opens a named pipe that another process on the same
 //! machine can drive and inspect: `\\.\pipe\rustamp-ctl-<key>`, where the key
 //! is the instance key (the class `/CLASS=` picks and the configuration
-//! `/CONFIG=` names) unless `--control=<name>` names its own. One JSON object
+//! `/CONFIG=` names) unless `--control=<name>` names its own; off Windows it
+//! is an owner-only Unix domain socket of the same name. One JSON object
 //! per line, typed (`rustamp-app::control`): `ping`, `snapshot`, `wait` and
 //! the player's own [`Command`](rustamp_core::command::Command)s, which travel
 //! the same funnel a keystroke uses. The channel is gated by the same window

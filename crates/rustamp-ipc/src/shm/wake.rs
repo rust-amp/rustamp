@@ -194,13 +194,15 @@ mod backend {
 #[cfg(not(windows))]
 mod backend {
     use super::{RingError, WaitOutcome};
-    use std::sync::Arc;
+    use std::collections::HashMap;
     use std::sync::Condvar;
     use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::sync::{Arc, Weak};
     use std::time::Duration;
 
     /// One auto-reset latch: a flag a waiter clears, signaled by the peer.
-    /// Used only by the informational non-Windows CI job.
+    /// Off Windows the rings stay within one process.
     pub(super) struct Waiter {
         flag: Mutex<bool>,
         condvar: Condvar,
@@ -219,14 +221,29 @@ mod backend {
     /// (producer + consumer in the same process) shares the same state.
     pub(super) type Handle = Arc<Waiter>;
 
-    pub(super) fn do_create(_name: &str) -> Result<Handle, RingError> {
-        Ok(Arc::new(Waiter::new()))
+    /// The latch of a name, the counterpart of a named kernel event: everyone
+    /// who names it holds the same latch for as long as anyone holds it.
+    fn named(name: &str) -> Handle {
+        static NAMED: OnceLock<Mutex<HashMap<String, Weak<Waiter>>>> = OnceLock::new();
+        let mut latches = NAMED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(latch) = latches.get(name).and_then(Weak::upgrade) {
+            return latch;
+        }
+        latches.retain(|_, latch| latch.strong_count() > 0);
+        let latch = Arc::new(Waiter::new());
+        latches.insert(name.to_owned(), Arc::downgrade(&latch));
+        latch
     }
 
-    pub(super) fn do_open(_name: &str) -> Result<Handle, RingError> {
-        // In-process: create fresh waiters. Callers that need to share the same
-        // wake between producer and consumer should use `create` + `clone`.
-        Ok(Arc::new(Waiter::new()))
+    pub(super) fn do_create(name: &str) -> Result<Handle, RingError> {
+        Ok(named(name))
+    }
+
+    pub(super) fn do_open(name: &str) -> Result<Handle, RingError> {
+        Ok(named(name))
     }
 
     pub(super) fn do_signal(handle: &Handle) -> Result<(), RingError> {

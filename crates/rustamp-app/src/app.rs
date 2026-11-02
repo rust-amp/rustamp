@@ -4070,6 +4070,7 @@ impl App {
             .filter(|(_, kind)| *kind == PluginKind::Input)
             .map(|(path, _)| path)
             .collect();
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut registry = self.builtin_registry.clone();
         #[cfg(not(windows))]
         if !inputs.is_empty() {

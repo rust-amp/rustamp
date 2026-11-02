@@ -94,8 +94,8 @@ impl Base {
         // absolute). A UNC-looking `//host/share` stays a file everywhere.
         let url_root_relative = cfg!(unix)
             && matches!(self, Base::Url(_))
-            && raw.starts_with('/')
-            && !raw.starts_with("//");
+            && normalized.starts_with('/')
+            && !normalized.starts_with("//");
         if !url_root_relative && (path.is_absolute() || is_drive(&normalized)) {
             return Some(MediaLocation::File(path.to_path_buf()));
         }
@@ -323,6 +323,19 @@ fn join_url(base: &str, rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two separators mean the same here, as they do on Windows.
+    #[test]
+    fn a_root_relative_entry_against_a_url_stays_a_url_with_either_separator() {
+        let base = Base::Url("http://example.com/lists/a.m3u".to_owned());
+        for raw in ["/x.mp3", "\\x.mp3"] {
+            assert!(
+                matches!(base.resolve(raw), Some(MediaLocation::Url(_))),
+                "{raw}: {:?}",
+                base.resolve(raw)
+            );
+        }
+    }
 
     fn file(p: &str) -> MediaLocation {
         MediaLocation::File(PathBuf::from(p))

@@ -69,7 +69,6 @@
 //! module's own; `Command`, `Event` and `PlayerState` are the `rustamp-proto`
 //! wire types, unchanged (no contract change).
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -116,14 +115,18 @@ pub fn pipe_name(key: &str) -> String {
 /// The socket an instance key is served on (off Windows the channel is a Unix
 /// domain socket, the counterpart of the Windows named pipe).
 ///
-/// It lives in the user's runtime directory when there is one, so only this
-/// user can reach it, and carries the instance key, so two instances never
-/// collide.
+/// It lives in the user's runtime directory, or without one in a private
+/// directory under the home, so only this user can reach it or take its name.
+/// The temporary directory is the last resort of an environment with neither.
+/// The name carries the instance key, so two instances never collide.
 #[cfg(not(windows))]
 pub fn pipe_name(key: &str) -> String {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .filter(|dir| dir.is_dir())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".rustamp"))
+        })
         .unwrap_or_else(std::env::temp_dir);
     dir.join(format!("rustamp-ctl-{key}.sock"))
         .to_string_lossy()
@@ -721,7 +724,7 @@ mod imp {
 mod imp {
     //! Unix listener: one Unix domain socket, one thread per connection.
 
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -748,10 +751,19 @@ mod imp {
         /// Binds the socket and starts the listener.
         pub fn start(pipe: &str, handles: Handles) -> std::io::Result<Self> {
             let path = PathBuf::from(pipe);
+            if let Some(parent) = path.parent() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
             // A socket file left by a run that did not exit cleanly would make
             // `bind` fail. A live listener behind it is the other instance of
-            // the same key, which the single-instance guard already refuses.
-            if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
+            // the same key, which the single-instance guard already refuses,
+            // and anything that is not a socket is not this channel's to remove.
+            let is_socket = std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_socket());
+            if is_socket && std::os::unix::net::UnixStream::connect(&path).is_err() {
                 let _ = std::fs::remove_file(&path);
             }
             let listener = UnixListener::bind(&path)?;
